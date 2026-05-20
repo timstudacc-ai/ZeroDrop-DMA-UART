@@ -2,7 +2,12 @@
 /**
  ******************************************************************************
  * @file           : main.c
- * @brief          : Main program body
+ * @brief          : Application Layer.
+ *                   This file acts as the Application Layer. It ties together
+ *                   the Driver Layer (uart_ring_buffer) and Protocol Layer (packet_protocol).
+ *                   It leverages interrupts to move data in and out of the ring
+ *                   buffers, and runs the application logic in the main loop,
+ *                   processing valid packets provided by the Protocol Layer.
  ******************************************************************************
  * @attention
  *
@@ -24,6 +29,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <string.h>
 #include <stdbool.h>
 /* USER CODE END Includes */
 
@@ -34,6 +40,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#include "uart_ring_buffer.h"
+#include "packet_protocol.h"
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -44,19 +52,21 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-/* Глобальні змінні для асинхронного обміну */
-uint8_t rx_byte;
+/* Global variables for asynchronous communication */
 uint8_t tx_byte;
 volatile bool tx_ready = true;
 
-/* Екземпляри кільцевих буферів (RX та TX) */
+/* Ring buffer instances (RX and TX) */
 RingBuffer rx_buffer;
 RingBuffer tx_buffer;
+uint8_t my_payload[128]; /* Buffer for storing unpacked payload after CRC validation */
+uint8_t rx_dma_buf[128]; /* Buffer for DMA reception */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
+
 
 /* USER CODE END PFP */
 
@@ -96,62 +106,89 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  /* Ініціалізуємо кільцеві буфери */
+  /* Initialize ring buffers */
   rb_init(&rx_buffer);
   rb_init(&tx_buffer);
 
-  /* Зводимо "курок" переривання: очікуємо 1 байт даних */
-  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+  /* Start DMA reception with IDLE Line Detection */
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, rx_dma_buf, sizeof(rx_dma_buf));
+
+ 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* Перевіряємо наявність нових необроблених даних у кільцевому буфері */
-    uint8_t process_byte;
-    if (rb_pop(&rx_buffer, &process_byte))
-    {
-      /* 2. Логіка керування периферією 
-      тут може бути будь-яка логіка */
-      if (process_byte == '1')
-      {
-        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_13);
-      }
-      else if (process_byte == '2')
-      {
-        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14);
-      }
-      else if (process_byte == '3')
-      {
-        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_15);
-      }
-
-      /* 1. Асинхронне ЕХО: додаємо байт у чергу TX буфера */
-      
-      /* СТВОРЕННЯ ЗВОРОТНОГО ТИСКУ (Backpressure): 
-         Якщо буфер повний, активно чекаємо (Spinlock), поки апаратний UART 
-         через переривання не відправить хоча б один байт і не звільнить місце. */
-      while (rb_is_full(&tx_buffer)) 
-      {
-        /* Процесор заблокований тут, але NVIC продовжує обробляти переривання! */
-      }
-      
-      rb_push(&tx_buffer, process_byte);
-
-      /* Якщо передавач зараз "спить", даємо йому стартовий поштовх (Kick-start) */
-      if (tx_ready && !rb_is_empty(&tx_buffer))
-      {
-        tx_ready = false;                           /* Переводимо передавач у зайнятий стан */
-        if (rb_pop(&tx_buffer, &tx_byte)) {         /* Беремо найстаріший байт з хвоста */
-          HAL_UART_Transmit_IT(&huart1, &tx_byte, 1); /* Запускаємо першу передачу */
-        }
-      }
-    }
-
+    
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* Check if there is a valid packet with correct CRC in the ring buffer */
+    /* We read it as a binary array first to determine its type */
+    uint16_t len = pkt_pop_binary_packet_crc(&rx_buffer, 0xAA, my_payload, sizeof(my_payload) - 1);
+    if (len > 0)
+    {
+      my_payload[len] = '\0'; /* Null terminate in case it is a string */
+
+      /* 1. Determine if the payload is a string or a raw binary array.
+         If all characters are printable ASCII (32-126), we treat it as a String.
+         Otherwise, we treat it as a raw binary array. */
+      bool is_string = true;
+      for (uint16_t i = 0; i < len; i++) {
+          if (my_payload[i] < 32 || my_payload[i] > 126) {
+              is_string = false;
+              break;
+          }
+      }
+
+      if (is_string)
+      {
+          /* --- DEMONSTRATION OF STRING HANDLING --- */
+          if (strcmp((char*)my_payload, "LED_ON") == 0)
+          {
+              HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET); /* Turn ON LED (active low) */
+              pkt_push_string_crc(&tx_buffer, 0xAA, "LED is now ON");
+          }
+          else if (strcmp((char*)my_payload, "LED_OFF") == 0)
+          {
+              HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET); /* Turn OFF LED */
+              pkt_push_string_crc(&tx_buffer, 0xAA, "LED is now OFF");
+          }
+          else if (strcmp((char*)my_payload, "TEST_CAPACITY") == 0)
+          {
+              /* Generate a 110 character string to test tx_buffer capacity */
+              char cap_test[120];
+              memset(cap_test, 'C', 110);
+              cap_test[110] = '\0';
+              pkt_push_string_crc(&tx_buffer, 0xAA, cap_test);
+          }
+          else
+          {
+              /* Echo the string back with a prefix */
+              pkt_push_string_crc(&tx_buffer, 0xAA, "Echo: ");
+              pkt_push_string_crc(&tx_buffer, 0xAA, (char*)my_payload);
+          }
+      }
+      else
+      {
+          /* --- DEMONSTRATION OF RAW BINARY ARRAY HANDLING --- */
+          /* Echo the raw binary array exactly as received without string processing */
+          pkt_push_binary_packet_crc(&tx_buffer, 0xAA, my_payload, len);
+      }
+
+      /* Safely trigger the TX interrupt to send the data if the transmitter is idle */
+      __disable_irq();
+      if (tx_ready && !rb_is_empty(&tx_buffer))
+      {
+        tx_ready = false;
+        if (rb_pop(&tx_buffer, &tx_byte))
+        {
+          HAL_UART_Transmit_IT(&huart1, &tx_byte, 1);
+        }
+      }
+      __enable_irq();
+    }
   }
   /* USER CODE END 3 */
 }
@@ -198,41 +235,51 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 /**
- * @brief  Функція зворотного виклику (Callback), яка автоматично
- *         викликається HAL при успішному прийомі заданої кількості байт.
- * @param  huart: покажчик на структуру конфігурації UART
+ * @brief  Function for asynchronous transmission of a data array via UART.
+ * @param  data: Pointer to the data array to send.
+ * @param  len: Length of the data array.
+ * @retval None
  */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+
+
+/**
+ * @brief  Rx Event Callback (IDLE + DMA).
+ *         Automatically called by HAL when the UART line becomes free (IDLE),
+ *         or when the DMA buffer is completely filled.
+ */
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
-  /* Перевіряємо, що переривання прийшло саме від USART1 */
   if (huart->Instance == USART1)
   {
-      /* Додаємо байт у буфер. У разі переповнення rb_push оновлює overflow_count */
-      rb_push(&rx_buffer, rx_byte);
+    /* 1. Transfer data to the ring buffer for packet processing in main */
+    rb_push_array(&rx_buffer, rx_dma_buf, Size);
 
-    /* 3. Re-arming (перезарядження): вмикаємо переривання знову,
-          оскільки HAL автоматично його вимкнув після прийому 1 байта */
-    HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+    /* 2. Since RX DMA in CubeMX is configured as CIRCULAR, we forcibly stop RX
+          and restart it. This guarantees new data is written from the start of rx_dma_buf. */
+    HAL_UART_AbortReceive(&huart1);
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart1, rx_dma_buf, sizeof(rx_dma_buf));
   }
 }
 
 /**
- * @brief  Callback завершення передачі (Transmission Complete).
- *         Викликається HAL, коли зсувний регістр TX фізично спустошено.
+ * @brief  Tx Transfer completed callback.
+ *         Called by HAL when the TX shift register is physically empty.
+ * @param  huart: pointer to a UART_HandleTypeDef structure that contains
+ *                the configuration information for the specified UART module.
  */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART1)
   {
-    /* Перевіряємо, чи є ще дані у черзі на відправку */
-      if (rb_pop(&tx_buffer, &tx_byte))
+    /* Check if there is more data in the queue to send */
+    if (rb_pop(&tx_buffer, &tx_byte))
     {
-      /* Запускаємо апаратну передачу наступного байта */
+      /* Start hardware transmission of the next byte */
       HAL_UART_Transmit_IT(&huart1, &tx_byte, 1);
     }
     else
     {
-      /* Якщо черга порожня, переводимо передавач у стан очікування (Idle) */
+      /* If the queue is empty, put the transmitter in Idle state */
       tx_ready = true;
     }
   }

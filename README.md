@@ -24,6 +24,12 @@ This architecture implements a **Zero-CPU-Overhead Reception Path**:
 > [!TIP]
 > **Optimization Benefit:** By combining DMA with IDLE Line detection, the CPU only intervenes *once per data block* rather than *once per byte*. This allows the MCU to process complex payloads asynchronously without blocking mission-critical tasks or dropping frames during heavy traffic.
 
+### Ring Buffer Sizing
+The size of the ring buffers can be easily customized by modifying `RING_BUFFER_SIZE` inside `uart_ring_buffer.h`.
+
+> [!CAUTION]
+> **Sizing Rule:** To prevent buffer overrun and silent data loss, `RING_BUFFER_SIZE` should be configured to be **at least 2x larger** than the maximum possible size of any single received data payload.
+
 ---
 
 ## 2. Hardware Configuration Guide (STM32CubeMX)

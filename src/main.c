@@ -178,7 +178,7 @@ int main(void)
       }
 
       /* Safely trigger the TX interrupt to send the data if the transmitter is idle */
-      __disable_irq();
+      NVIC_DisableIRQ(USART1_IRQn);
       if (tx_ready && !rb_is_empty(&tx_buffer))
       {
         tx_ready = false;
@@ -187,7 +187,7 @@ int main(void)
           HAL_UART_Transmit_IT(&huart1, &tx_byte, 1);
         }
       }
-      __enable_irq();
+      NVIC_EnableIRQ(USART1_IRQn);
     }
   }
   /* USER CODE END 3 */
@@ -277,11 +277,29 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
       /* Start hardware transmission of the next byte */
       HAL_UART_Transmit_IT(&huart1, &tx_byte, 1);
     }
+    }
     else
     {
       /* If the queue is empty, put the transmitter in Idle state */
       tx_ready = true;
     }
+  }
+}
+
+/**
+ * @brief  UART error callbacks.
+ *         Called automatically by HAL if there is an error (e.g. Overrun, Noise, Framing).
+ *         We use this to recover from hardware errors without a hard reset.
+ */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    /* On error, abort the current reception to clear hardware state */
+    HAL_UART_AbortReceive(huart);
+    
+    /* Restart the DMA reception to immediately recover and continue listening */
+    HAL_UARTEx_ReceiveToIdle_DMA(huart, rx_dma_buf, sizeof(rx_dma_buf));
   }
 }
 /* USER CODE END 4 */

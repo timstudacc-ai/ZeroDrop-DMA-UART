@@ -23,9 +23,9 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "dma.h"
 #include "usart.h"
 #include "gpio.h"
-#include "uart_ring_buffer.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -52,21 +52,22 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-/* Global variables for asynchronous communication */
-uint8_t tx_byte;
-volatile bool tx_ready = true;
-
 /* Ring buffer instances (RX and TX) */
 RingBuffer rx_buffer;
 RingBuffer tx_buffer;
 uint8_t my_payload[128]; /* Buffer for storing unpacked payload after CRC validation */
 uint8_t rx_dma_buf[128]; /* Buffer for DMA reception */
+
+/* DMA TX Ping-Pong Double Buffers */
+uint8_t tx_buf_A[128];               /* DMA TX buffer A */
+uint8_t tx_buf_B[128];               /* DMA TX buffer B */
+volatile bool tx_dma_busy = false;    /* True when DMA TX is actively transmitting */
+volatile uint8_t tx_active_buf = 0;   /* 0 = Buffer A is being transmitted, 1 = Buffer B */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
 
 /* USER CODE END PFP */
 
@@ -104,6 +105,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   /* Initialize ring buffers */
@@ -113,14 +115,13 @@ int main(void)
   /* Start DMA reception with IDLE Line Detection */
   HAL_UARTEx_ReceiveToIdle_DMA(&huart1, rx_dma_buf, sizeof(rx_dma_buf));
 
- 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -135,59 +136,66 @@ int main(void)
          If all characters are printable ASCII (32-126), we treat it as a String.
          Otherwise, we treat it as a raw binary array. */
       bool is_string = true;
-      for (uint16_t i = 0; i < len; i++) {
-          if (my_payload[i] < 32 || my_payload[i] > 126) {
-              is_string = false;
-              break;
-          }
+      for (uint16_t i = 0; i < len; i++)
+      {
+        if (my_payload[i] < 32 || my_payload[i] > 126)
+        {
+          is_string = false;
+          break;
+        }
       }
 
       if (is_string)
       {
-          /* --- DEMONSTRATION OF STRING HANDLING --- */
-          if (strcmp((char*)my_payload, "LED_ON") == 0)
-          {
-              HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET); /* Turn ON LED (active low) */
-              pkt_push_string_crc(&tx_buffer, 0xAA, "LED is now ON");
-          }
-          else if (strcmp((char*)my_payload, "LED_OFF") == 0)
-          {
-              HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET); /* Turn OFF LED */
-              pkt_push_string_crc(&tx_buffer, 0xAA, "LED is now OFF");
-          }
-          else if (strcmp((char*)my_payload, "TEST_CAPACITY") == 0)
-          {
-              /* Generate a 110 character string to test tx_buffer capacity */
-              char cap_test[120];
-              memset(cap_test, 'C', 110);
-              cap_test[110] = '\0';
-              pkt_push_string_crc(&tx_buffer, 0xAA, cap_test);
-          }
-          else
-          {
-              /* Echo the string back with a prefix */
-              pkt_push_string_crc(&tx_buffer, 0xAA, "Echo: ");
-              pkt_push_string_crc(&tx_buffer, 0xAA, (char*)my_payload);
-          }
+        /* --- DEMONSTRATION OF STRING HANDLING --- */
+        if (strcmp((char *)my_payload, "LED_ON") == 0)
+        {
+          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET); /* Turn ON LED (active low) */
+          pkt_push_string_crc(&tx_buffer, 0xAA, "LED is now ON");
+        }
+        else if (strcmp((char *)my_payload, "LED_OFF") == 0)
+        {
+          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET); /* Turn OFF LED */
+          pkt_push_string_crc(&tx_buffer, 0xAA, "LED is now OFF");
+        }
+        else if (strcmp((char *)my_payload, "TEST_CAPACITY") == 0)
+        {
+          /* Generate a 110 character string to test tx_buffer capacity */
+          char cap_test[120];
+          memset(cap_test, 'C', 110);
+          cap_test[110] = '\0';
+          pkt_push_string_crc(&tx_buffer, 0xAA, cap_test);
+        }
+        else
+        {
+          /* Echo the string back with a prefix */
+          pkt_push_string_crc(&tx_buffer, 0xAA, "Echo: ");
+          pkt_push_string_crc(&tx_buffer, 0xAA, (char *)my_payload);
+        }
       }
       else
       {
-          /* --- DEMONSTRATION OF RAW BINARY ARRAY HANDLING --- */
-          /* Echo the raw binary array exactly as received without string processing */
-          pkt_push_binary_packet_crc(&tx_buffer, 0xAA, my_payload, len);
+        /* --- DEMONSTRATION OF RAW BINARY ARRAY HANDLING --- */
+        /* Echo the raw binary array exactly as received without string processing */
+        pkt_push_binary_packet_crc(&tx_buffer, 0xAA, my_payload, len);
       }
 
-      /* Safely trigger the TX interrupt to send the data if the transmitter is idle */
+      /* Kick-off DMA TX if the transmitter is idle.
+       * Mask both TX-related IRQs to prevent race with TxCpltCallback. */
+      NVIC_DisableIRQ(DMA2_Stream7_IRQn);
       NVIC_DisableIRQ(USART1_IRQn);
-      if (tx_ready && !rb_is_empty(&tx_buffer))
+      if (!tx_dma_busy && !rb_is_empty(&tx_buffer))
       {
-        tx_ready = false;
-        if (rb_pop(&tx_buffer, &tx_byte))
+        uint16_t tx_len = rb_pop_array(&tx_buffer, tx_buf_A, sizeof(tx_buf_A));
+        if (tx_len > 0)
         {
-          HAL_UART_Transmit_IT(&huart1, &tx_byte, 1);
+          tx_dma_busy = true;
+          tx_active_buf = 0;
+          HAL_UART_Transmit_DMA(&huart1, tx_buf_A, tx_len);
         }
       }
       NVIC_EnableIRQ(USART1_IRQn);
+      NVIC_EnableIRQ(DMA2_Stream7_IRQn);
     }
   }
   /* USER CODE END 3 */
@@ -241,7 +249,6 @@ void SystemClock_Config(void)
  * @retval None
  */
 
-
 /**
  * @brief  Rx Event Callback (IDLE + DMA).
  *         Automatically called by HAL when the UART line becomes free (IDLE),
@@ -262,26 +269,41 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 }
 
 /**
- * @brief  Tx Transfer completed callback.
- *         Called by HAL when the TX shift register is physically empty.
- * @param  huart: pointer to a UART_HandleTypeDef structure that contains
- *                the configuration information for the specified UART module.
+ * @brief  DMA TX Transfer completed callback (Ping-Pong).
+ *         Called by HAL when the DMA has finished transmitting a buffer.
+ *         Immediately switches to the other buffer for zero-gap transmission.
  */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART1)
   {
-    /* Check if there is more data in the queue to send */
-    if (rb_pop(&tx_buffer, &tx_byte))
+    if (tx_active_buf == 0)
     {
-      /* Start hardware transmission of the next byte */
-      HAL_UART_Transmit_IT(&huart1, &tx_byte, 1);
-    }
+      /* Buffer A just finished — drain ring buffer into B and send */
+      uint16_t len = rb_pop_array(&tx_buffer, tx_buf_B, sizeof(tx_buf_B));
+      if (len > 0)
+      {
+        tx_active_buf = 1;
+        HAL_UART_Transmit_DMA(&huart1, tx_buf_B, len);
+      }
+      else
+      {
+        tx_dma_busy = false; /* Nothing left to send */
+      }
     }
     else
     {
-      /* If the queue is empty, put the transmitter in Idle state */
-      tx_ready = true;
+      /* Buffer B just finished — drain ring buffer into A and send */
+      uint16_t len = rb_pop_array(&tx_buffer, tx_buf_A, sizeof(tx_buf_A));
+      if (len > 0)
+      {
+        tx_active_buf = 0;
+        HAL_UART_Transmit_DMA(&huart1, tx_buf_A, len);
+      }
+      else
+      {
+        tx_dma_busy = false; /* Nothing left to send */
+      }
     }
   }
 }
@@ -297,7 +319,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   {
     /* On error, abort the current reception to clear hardware state */
     HAL_UART_AbortReceive(huart);
-    
+
     /* Restart the DMA reception to immediately recover and continue listening */
     HAL_UARTEx_ReceiveToIdle_DMA(huart, rx_dma_buf, sizeof(rx_dma_buf));
   }

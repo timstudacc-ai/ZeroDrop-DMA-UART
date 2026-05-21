@@ -5,87 +5,149 @@
 [![Framework](https://img.shields.io/badge/Framework-STM32CubeHAL-brightgreen.svg)](https://www.st.com/en/embedded-software/stm32cube-mcu-mpu-packages.html)
 [![Testing](https://img.shields.io/badge/Testing-HIL_Python-yellow.svg)](#)
 
-> **Objective:** A production-ready, zero-CPU-overhead UART driver implementation designed for the STM32F411CEU6 microcontroller. This project demonstrates advanced embedded software architecture, leveraging Direct Memory Access (DMA) alongside hardware interrupts to guarantee robust data handling under heavy backpressure, verified via an automated Hardware-in-the-Loop (HIL) stress test.
+> **Objective:** A production-ready, high-level UART driver implementation designed for the STM32F411CEU6 microcontroller. This project demonstrates an advanced embedded software architecture, leveraging Direct Memory Access (DMA) for **both data transmission (TX) and reception (RX)** to guarantee robust data handling with near-zero CPU overhead. It features double-buffering (Ping-Pong) for TX, a circular buffer with IDLE line detection for RX, and is verified via an automated Hardware-in-the-Loop (HIL) stress test.
 
 ---
 
 ## 1. Production Architecture Overview
 
-The core firmware architecture is built around the synergy of **DMA Circular Mode**, **UART IDLE Line Detection**, and a **Software Ring Buffer (FIFO)**. This approach eliminates the bottlenecks associated with standard blocking calls or byte-by-byte interrupt designs.
+The firmware is designed with a strict separation of concerns, divided into four distinct layers. This modular approach ensures that the application logic is completely decoupled from hardware constraints, eliminating bottlenecks associated with standard blocking calls or byte-by-byte interrupt designs.
 
-### DMA & IDLE Line Synergy
-Traditional interrupt-driven UART reception (e.g., `HAL_UART_Receive_IT`) triggers an Interrupt Service Routine (ISR) for every single incoming byte, leading to massive CPU overhead and potential data loss at high baud rates. 
+```mermaid
+flowchart TD
+    subgraph Hardware["1. Hardware Layer"]
+        direction TB
+        RX[Pin UART RX] -->|Physical Signal| USART_RX[USART1 RX]
+        USART_RX -->|Byte Assembly| DR_RX[Data Register DR]
+        DR_RX -->|DMA Request| DMA_RX[DMA RX Stream]
+        DMA_RX -->|Circular Mode| DMABUF[(rx_dma_buf)]
+        
+        DMA_TX[DMA TX Stream] -->|Normal Mode| DR_TX[Data Register DR]
+        DR_TX -->|Byte Shift| USART_TX[USART1 TX]
+        USART_TX -->|Physical Signal| TX[Pin UART TX]
+    end
 
-This architecture implements a **Zero-CPU-Overhead Reception Path**:
-1. **DMA Streaming:** The DMA controller directly transfers incoming bytes from the UART Data Register (`DR`) to a temporary RAM buffer (`rx_dma_buf`) in the background. The CPU is completely unburdened during active transmission.
-2. **IDLE Event Detection:** When the host finishes sending a burst of data, the UART line remains logically high for one frame. The hardware detects this silence and fires an **IDLE Line Interrupt**.
-3. **Data Commit:** The `HAL_UARTEx_RxEventCallback` is triggered. The driver calculates exactly how many bytes were received, pushes the block into the application's Ring Buffer, and seamlessly restarts the DMA stream.
+    subgraph ISR["2. ISR Layer"]
+        direction TB
+        IDLE[IDLE Line Event] -->|Interrupt| RXCB[HAL_UARTEx_RxEventCallback]
+        DMABUF -.->|Extract Block| RXCB
+        RXCB -->|rb_push_array| RINGBUF[(Software Ring Buffer)]
+        
+        TC[Tx Complete Event] -->|Interrupt| TXCB[HAL_UART_TxCpltCallback]
+        TXCB -->|Toggle Active DMA Buffer| DMA_TX
+    end
+
+    subgraph Protocol["3. Protocol Layer"]
+        direction TB
+        RINGBUF -.->|Raw Bytes| POP[pkt_pop_binary_packet_crc]
+        POP -->|Sync Start Byte| SYNC{Valid Start & Length?}
+        SYNC -- Yes --> CRC{Verify XOR CRC}
+        SYNC -- No --> DROP1[Drop Garbage]
+        CRC -- Valid --> PAYLOAD[Extract Payload]
+        CRC -- Invalid --> DROP2[Drop Corrupted]
+    end
+
+    subgraph App["4. Application Layer"]
+        direction TB
+        PAYLOAD -.->|Clean Data| MAIN[Main Loop / Business Logic]
+        MAIN -->|Process Command| EXEC[Execute Action]
+        EXEC -->|Generate Response| FORMAT[Format TX Packet]
+        FORMAT -->|Fill tx_buf_A or tx_buf_B| TXBUF[(TX Ping-Pong Buffers)]
+        TXBUF -.->|Trigger DMA Transmit| TC
+    end
+
+    Hardware ==> ISR
+    ISR ==> Protocol
+    Protocol ==> App
+    App ==> ISR
+    
+    classDef layer fill:#2b2d31,stroke:#a6adc8,stroke-width:2px,color:#cdd6f4
+    class Hardware,ISR,Protocol,App layer
+```
+
+### 1. Hardware Layer
+At the lowest level, the driver utilizes DMA for both directions:
+- **RX Path:** The physical `UART RX` pin receives electrical signals which are assembled by the USART1 Peripheral. The **DMA Controller** automatically pulls raw bytes from the Data Register and streams them into a temporary memory array (`rx_dma_buf`) in Circular Mode.
+- **TX Path:** For transmission, the DMA Controller pushes data directly from the active transmit buffer to the USART1 Data Register in Normal Mode. The CPU is completely unburdened during active data transfers in both directions.
+
+### 2. Interrupt Service Routine (ISR) Layer
+- **RX IDLE Handling:** When the host finishes transmitting a burst of bytes, an **IDLE Line Interrupt** fires. The `HAL_UARTEx_RxEventCallback` quickly copies the incoming block from the DMA buffer into the thread-safe **Ring Buffer**.
+- **TX Double Buffering (Ping-Pong):** When a DMA TX transfer finishes, a **TX Complete Interrupt** fires. The driver uses two buffers (`tx_buf_A` and `tx_buf_B`). While the DMA sends buffer A, the application can safely prepare the next packet in buffer B. The ISR effortlessly swaps the active pointer, keeping the pipeline saturated.
+
+### 3. Protocol Layer
+Running asynchronously within the main loop, the protocol layer (`packet_protocol.c`) consumes raw bytes from the RX Ring Buffer. It parses the encapsulated binary frame `[Start][Length][Payload][CRC]`. It computes the XOR checksum over the payload, safely extracting clean data or dropping corrupted packets. 
+
+### 4. Application Layer
+The highest level of abstraction. It receives error-free payloads from the protocol layer and generates responses. To transmit data, it formats a response packet, places it in the inactive TX ping-pong buffer, and signals the DMA to kick off transmission. It remains completely abstracted from hardware timings or byte-level parsing.
 
 > [!TIP]
-> **Optimization Benefit:** By combining DMA with IDLE Line detection, the CPU only intervenes *once per data block* rather than *once per byte*. This allows the MCU to process complex payloads asynchronously without blocking mission-critical tasks or dropping frames during heavy traffic.
+> **Optimization Benefit:** By combining DMA Ping-Pong for TX with DMA+IDLE Line detection for RX, the CPU only intervenes *per data block* rather than *per byte*. This makes it a high-level driver that can process complex payloads asynchronously without blocking mission-critical tasks or dropping frames under heavy traffic.
 
 ### Ring Buffer Sizing
-The size of the ring buffers can be easily customized by modifying `RING_BUFFER_SIZE` inside `uart_ring_buffer.h`.
+The size of the ring buffers can be easily customized by modifying `RING_BUFFER_SIZE` inside `lib/Ring_buffer/uart_ring_buffer.h`.
 
 > [!CAUTION]
 > **Sizing Rule:** To prevent buffer overrun and silent data loss, `RING_BUFFER_SIZE` should be configured to be **at least 2x larger** than the maximum possible size of any single received data payload.
 
 ---
 
-## 2. Hardware Configuration Guide (STM32CubeMX)
+## 2. Hardware Configuration Guide
 
-To replicate this architecture, exact peripheral configuration within STM32CubeMX is mandatory. The following checklist ensures proper hardware linkage for the DMA controller and UART interrupts.
+To replicate this architecture, ensure proper hardware linkage for the DMA controller and UART interrupts.
 
 | Peripheral / Feature | Parameter | Required Configuration |
 | :--- | :--- | :--- |
-| **USART1** | Mode | Asynchronous |
-| **USART1 / NVIC** | USART1 global interrupt | **Enabled** |
-| **USART1 / DMA** | DMA Request | `USART1_RX` |
-| **DMA Settings** | Stream | `DMA2 Stream 2` |
-| **DMA Settings** | Mode | **Circular** |
+| **USARTX** | Mode | Asynchronous |
+| **USARTX / NVIC** | USARTX global interrupt | **Enabled** |
+| **USARTX / DMA (RX)** | DMA Request | `USARTX_RX` (Mode: **Circular**) |
+| **USARTX / DMA (TX)** | DMA Request | `USARTX_TX` (Mode: **Normal**) |
 | **DMA Settings** | Increment Address | Peripheral: **Disabled**, Memory: **Enabled** (MINC) |
 | **DMA Settings** | Data Width | Peripheral: `Byte`, Memory: `Byte` |
 
 > [!IMPORTANT]
-> **Initialization Order Matters:** Ensure that `MX_DMA_Init()` is called **before** `MX_USART1_UART_Init()` in the `main.c` initialization sequence. The UART handle links to the DMA handle during its MSP initialization, requiring the DMA clock to be active.
+> **Initialization Order Matters:** Ensure that the DMA controller (and its clock) is initialized **before** the UART initialization. The UART hardware links to the DMA channels during its initialization phase.
 
 ---
 
 ## 3. Hardware-in-the-Loop (HIL) Python Stress-Test Bench
 
-Validating firmware resilience requires more than manual terminal testing. This repository includes an automated Python-based testbench (`uart_testbench.py`) designed to subject the MCU to rigorous crash testing and validate data integrity under continuous load.
+Validating firmware resilience requires rigorous testing. This repository includes an automated Python-based testbench (`uart_testbench.py`) to validate data integrity under continuous load.
 
 ### Binary Protocol Container
-The testbench utilizes a structured binary protocol to encapsulate data, making it immune to stray bytes or desynchronization:
+The testbench utilizes a structured binary protocol to encapsulate data:
 `[Start Marker: 0xAA] [Length: 1B] [Payload: N bytes] [XOR Checksum: 1B]`
 
 ### Testbench Operational Logic
-- **Bombardment & Backpressure:** The script rapidly streams hundreds of dynamically generated packets to the STM32, testing the Ring Buffer's elasticity and the DMA's circular wrapping logic.
-- **Data Integrity Validation:** Every echoed packet is captured and its `XOR Checksum` is re-calculated. The testbench instantly flags dropped bytes, mismatched lengths, or corrupted frames.
-- **Metrics Calculation:** Upon completion, the script generates a comprehensive report calculating *Success Rate*, *Timeouts*, *Throughput (pkt/s)*, and *Effective Bitrate*.
+- **Bombardment & Backpressure:** Rapidly streams dynamically generated packets to test Ring Buffer elasticity and TX Ping-Pong efficiency.
+- **Data Integrity Validation:** Every echoed packet is captured and its `XOR Checksum` is re-calculated, instantly flagging corrupted frames.
+- **Metrics Calculation:** Reports *Success Rate*, *Timeouts*, *Throughput (pkt/s)*, and *Effective Bitrate*.
 
 ---
 
 ## 4. PlatformIO Project Layout
 
-The repository follows a clean, standardized PlatformIO directory structure, separating hardware abstraction, application logic, and testing scripts.
+The repository follows a clean, standardized PlatformIO directory structure.
 
 ```text
-📦 Ring_Buffer_UART_driver
+📦 stm32-high-perf-uart-dma-protocol
 ┣ 📂 include
 ┃ ┣ 📜 dma.h
 ┃ ┣ 📜 gpio.h
 ┃ ┣ 📜 main.h
-┃ ┣ 📜 packet_protocol.h     # Binary frame & string wrappers
-┃ ┣ 📜 uart_ring_buffer.h    # Thread-safe FIFO API
+┃ ┣ 📜 stm32f4xx_it.h
 ┃ ┗ 📜 usart.h
+┣ 📂 lib
+┃ ┣ 📂 Packey_protocol       # Binary frame logic & wrappers
+┃ ┃ ┣ 📜 packet_protocol.c
+┃ ┃ ┗ 📜 packet_protocol.h
+┃ ┗ 📂 Ring_buffer           # Thread-safe FIFO API
+┃   ┣ 📜 uart_ring_buffer.c
+┃   ┗ 📜 uart_ring_buffer.h
 ┣ 📂 src
 ┃ ┣ 📜 dma.c                 # DMA initialization
 ┃ ┣ 📜 gpio.c
 ┃ ┣ 📜 main.c                # App layer & callback handling
-┃ ┣ 📜 packet_protocol.c     # Packet parsing & CRC validation
 ┃ ┣ 📜 stm32f4xx_it.c        # Interrupt vectors
-┃ ┣ 📜 uart_ring_buffer.c    # Ring buffer logic
 ┃ ┗ 📜 usart.c               # UART initialization
 ┣ 📂 Test_script
 ┃ ┗ 📜 uart_testbench.py     # Python HIL stress-test bench

@@ -8,7 +8,8 @@
  */
 
 #include "packet_protocol.h"
-
+#include "al_crc.h"
+#include <string.h> /* For memcpy */
 /* =========================================================
  * Binary Protocol with CRC: Start Byte + Length + Data + CRC
  * ========================================================= */
@@ -26,12 +27,8 @@ uint16_t pkt_push_binary_packet_crc(RingBuffer *rb, uint8_t start_byte, const ui
     rb_push(rb, len);
     uint16_t pushed = rb_push_array(rb, data, len);
 
-    /* Calculate simple CRC (XOR of payload) */
-    uint8_t crc = 0;
-    for (uint16_t i = 0; i < len; i++)
-    {
-        crc ^= data[i];
-    }
+    /* Calculate 1-byte folded hardware CRC */
+    uint8_t crc = AL_CalculateCRC8(data, len);
     rb_push(rb, crc);
 
     return pushed + 3;
@@ -74,25 +71,28 @@ uint16_t pkt_pop_binary_packet_crc(RingBuffer *rb, uint8_t start_byte, uint8_t *
     rb_pop(rb, &dummy); /* Pop start */
     rb_pop(rb, &dummy); /* Pop len */
 
-    uint8_t calculated_crc = 0;
     uint16_t read_len = (payload_len <= max_len) ? payload_len : max_len;
 
-    for (uint16_t i = 0; i < read_len; i++)
+    /* Pop the full payload into a temporary stack buffer to calculate CRC */
+    uint8_t full_payload[255]; /* max payload_len is a uint8_t (255) */
+    for (uint16_t i = 0; i < payload_len; i++)
     {
-        rb_pop(rb, &out_data[i]);
-        calculated_crc ^= out_data[i];
+        rb_pop(rb, &full_payload[i]);
     }
-    for (uint16_t i = read_len; i < payload_len; i++)
-    {
-        rb_pop(rb, &dummy);
-        calculated_crc ^= dummy;
-    }
+    
+    uint8_t calculated_crc = AL_CalculateCRC8(full_payload, payload_len);
 
     uint8_t received_crc;
     rb_pop(rb, &received_crc);
 
     if (calculated_crc != received_crc)
         return 0; /* Corrupted packet, discard! */
+        
+    /* Copy valid data to the output buffer */
+    if (read_len > 0)
+    {
+        memcpy(out_data, full_payload, read_len);
+    }
     return read_len;
 }
 

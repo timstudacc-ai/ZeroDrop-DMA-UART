@@ -42,6 +42,8 @@
 /* USER CODE BEGIN PD */
 #include "uart_ring_buffer.h"
 #include "packet_protocol.h"
+#define RX_BUFFER_WATERMARK 32
+#define TX_BUFFER_WATERMARK 120
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -125,11 +127,43 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* Check if there is a valid packet with correct CRC in the ring buffer */
-    /* We read it as a binary array first to determine its type */
-    uint16_t len = pkt_pop_binary_packet_crc(&rx_buffer, 0xAA, my_payload, sizeof(my_payload) - 1);
-    if (len > 0)
+    
+    /* 1. Hardware RX Flow Control 
+     * Toggle UART Receiver Enable (RE) bit based on rx_buffer free space.
+     * Disabling RE forces the hardware RTS pin high (inactive).
+     */
+    uint16_t rx_count = rb_get_count(&rx_buffer);
+    uint16_t rx_free = (RING_BUFFER_SIZE - 1) - rx_count;
+    
+    if (rx_free < RX_BUFFER_WATERMARK)
     {
+      if (READ_BIT(huart1.Instance->CR1, USART_CR1_RE))
+      {
+        CLEAR_BIT(huart1.Instance->CR1, USART_CR1_RE);
+      }
+    }
+    else
+    {
+      if (!READ_BIT(huart1.Instance->CR1, USART_CR1_RE))
+      {
+        SET_BIT(huart1.Instance->CR1, USART_CR1_RE);
+      }
+    }
+
+    /* 2. Software TX Flow Control (Option 2)
+     * Only process incoming packets if we have enough space in the TX buffer 
+     * to safely store the maximum possible response. 
+     */
+    uint16_t tx_count = rb_get_count(&tx_buffer);
+    uint16_t tx_free = (RING_BUFFER_SIZE - 1) - tx_count;
+    
+    if (tx_free >= TX_BUFFER_WATERMARK)
+    {
+      /* Check if there is a valid packet with correct CRC in the ring buffer */
+      /* We read it as a binary array first to determine its type */
+      uint16_t len = pkt_pop_binary_packet_crc(&rx_buffer, 0xAA, my_payload, sizeof(my_payload) - 1);
+      if (len > 0)
+      {
       my_payload[len] = '\0'; /* Null terminate in case it is a string */
 
       /* 1. Determine if the payload is a string or a raw binary array.
@@ -179,24 +213,25 @@ int main(void)
         /* Echo the raw binary array exactly as received without string processing */
         pkt_push_binary_packet_crc(&tx_buffer, 0xAA, my_payload, len);
       }
-
-      /* Kick-off DMA TX if the transmitter is idle.
-       * Mask both TX-related IRQs to prevent race with TxCpltCallback. */
-      NVIC_DisableIRQ(DMA2_Stream7_IRQn);
-      NVIC_DisableIRQ(USART1_IRQn);
-      if (!tx_dma_busy && !rb_is_empty(&tx_buffer))
-      {
-        uint16_t tx_len = rb_pop_array(&tx_buffer, tx_buf_A, sizeof(tx_buf_A));
-        if (tx_len > 0)
-        {
-          tx_dma_busy = true;
-          tx_active_buf = 0;
-          HAL_UART_Transmit_DMA(&huart1, tx_buf_A, tx_len);
-        }
       }
-      NVIC_EnableIRQ(USART1_IRQn);
-      NVIC_EnableIRQ(DMA2_Stream7_IRQn);
     }
+
+    /* Kick-off DMA TX if the transmitter is idle.
+     * Mask both TX-related IRQs to prevent race with TxCpltCallback. */
+    NVIC_DisableIRQ(DMA2_Stream7_IRQn);
+    NVIC_DisableIRQ(USART1_IRQn);
+    if (!tx_dma_busy && !rb_is_empty(&tx_buffer))
+    {
+      uint16_t tx_len = rb_pop_array(&tx_buffer, tx_buf_A, sizeof(tx_buf_A));
+      if (tx_len > 0)
+      {
+        tx_dma_busy = true;
+        tx_active_buf = 0;
+        HAL_UART_Transmit_DMA(&huart1, tx_buf_A, tx_len);
+      }
+    }
+    NVIC_EnableIRQ(USART1_IRQn);
+    NVIC_EnableIRQ(DMA2_Stream7_IRQn);
   }
   /* USER CODE END 3 */
 }

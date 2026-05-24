@@ -91,7 +91,19 @@ The size of the ring buffers can be easily customized by modifying `RING_BUFFER_
 
 ---
 
-## 2. Hardware Configuration Guide
+## 2. Cascading RTS/CTS Flow Control
+
+To guarantee zero data loss even under extreme load or when the application is busy, this driver implements a fully integrated hardware/software flow control cascade:
+
+1. **Hardware RX Flow Control (Option 1):** The `main.c` loop monitors `rx_buffer` free space. If it drops below `RX_BUFFER_WATERMARK`, it temporarily clears the UART Receiver Enable (`RE`) bit. This forces the STM32's hardware to de-assert the **RTS** pin, safely instructing the remote device to halt transmission before our software buffer overflows.
+2. **Software TX Flow Control (Option 2):** Before processing incoming packets, the application checks `tx_buffer` free space against `TX_BUFFER_WATERMARK`. If there isn't enough space for a response, it pauses processing, causing `rx_buffer` to fill up and naturally trigger the Hardware RX Flow Control.
+3. **Hardware TX Flow Control (Option 3):** If the remote device de-asserts its RTS (our **CTS** pin), the STM32 hardware automatically pauses UART TX DMA transfers. This causes our `tx_buffer` to fill up, which triggers the Software TX Flow Control, which ultimately halts reception via RTS.
+
+This creates a perfect backpressure mechanism stretching from the remote device's RX buffer all the way back to the remote device's TX buffer, ensuring completely lossless communication.
+
+---
+
+## 3. Hardware Configuration Guide
 
 To replicate this architecture, ensure proper hardware linkage for the DMA controller and UART interrupts.
 
@@ -109,7 +121,7 @@ To replicate this architecture, ensure proper hardware linkage for the DMA contr
 
 ---
 
-## 3. Hardware-in-the-Loop (HIL) Python Stress-Test Bench
+## 4. Hardware-in-the-Loop (HIL) Python Stress-Test Bench
 
 Validating firmware resilience requires rigorous testing. This repository includes an automated Python-based testbench (`uart_testbench.py`) to validate data integrity under continuous load.
 
@@ -124,7 +136,7 @@ The testbench utilizes a structured binary protocol to encapsulate data:
 
 ---
 
-## 4. PlatformIO Project Layout
+## 5. PlatformIO Project Layout
 
 The repository follows a clean, standardized PlatformIO directory structure.
 

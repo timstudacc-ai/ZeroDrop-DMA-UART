@@ -108,18 +108,38 @@ class UARTTestbench:
             print(f"[INFO] Serial port {self._port_name} closed.")
 
     @staticmethod
-    def calculate_xor_checksum(data: bytes | bytearray) -> int:
-        crc: int = 0
-        for byte in data:
-            crc ^= byte
-        return crc & 0xFF
+    def calculate_hardware_crc8(data: bytes | bytearray) -> int:
+        """
+        Calculates the STM32F4 hardware CRC-32 (poly 0x4C11DB7, init 0xFFFFFFFF),
+        padding to 32-bit words, and folding the result to 8 bits.
+        """
+        padded_data = bytearray(data)
+        while len(padded_data) % 4 != 0:
+            padded_data.append(0)
+            
+        crc = 0xFFFFFFFF
+        poly = 0x04C11DB7
+        
+        # STM32 reads as little-endian 32-bit words, then processes MSB first
+        for i in range(0, len(padded_data), 4):
+            word = struct.unpack("<I", padded_data[i:i+4])[0]
+            crc ^= word
+            for _ in range(32):
+                if crc & 0x80000000:
+                    crc = ((crc << 1) ^ poly) & 0xFFFFFFFF
+                else:
+                    crc = (crc << 1) & 0xFFFFFFFF
+                    
+        # XOR fold into 8 bits
+        crc8 = (crc & 0xFF) ^ ((crc >> 8) & 0xFF) ^ ((crc >> 16) & 0xFF) ^ ((crc >> 24) & 0xFF)
+        return crc8
 
     def build_packet(self, payload: bytes | bytearray) -> bytearray:
         if len(payload) > MAX_PAYLOAD_LEN:
             raise ValueError(f"Payload too large: {len(payload)} bytes")
 
         length_byte = struct.pack("B", len(payload))
-        checksum = struct.pack("B", self.calculate_xor_checksum(payload))
+        checksum = struct.pack("B", self.calculate_hardware_crc8(payload))
 
         body = bytearray(length_byte) + bytearray(payload) + bytearray(checksum)
         packet = bytearray([START_MARKER]) + body
@@ -166,7 +186,7 @@ class UARTTestbench:
 
         payload = body[:-1]
         received_crc = body[-1]
-        calculated_crc = self.calculate_xor_checksum(payload)
+        calculated_crc = self.calculate_hardware_crc8(payload)
 
         if received_crc != calculated_crc:
             return False, payload, f"CRC ERROR: Expected 0x{calculated_crc:02X}, got 0x{received_crc:02X}"

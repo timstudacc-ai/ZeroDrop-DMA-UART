@@ -182,16 +182,22 @@ class UARTTestbench:
         num_packets: int = 1000,
         payload_size: int = 8,
         mode: str = "binary",
+        modifiers: list = None,
         verbose: bool = False
     ) -> TestMetrics:
         
-        if payload_size < 1 or payload_size > MAX_PAYLOAD_LEN:
-            raise ValueError(f"payload_size must be 1–{MAX_PAYLOAD_LEN}")
+        if modifiers is None:
+            modifiers = []
+        
+        has_overflow = "overflow" in modifiers
+        has_burst = "burst" in modifiers
+        has_noise = "noise" in modifiers
+        has_fragmented = "fragmented" in modifiers
 
-        # The MCU tx_buffer is 128 bytes. In string mode, MCU echoes "Echo: " (9 bytes total packet) 
-        # and then the actual payload (payload_size + 3 bytes). 
-        # If payload_size > 111, the second packet won't fit in the TX buffer and will drop!
-        if mode == "string" and payload_size > 110:
+        if payload_size < 1:
+            raise ValueError(f"payload_size must be >= 1")
+
+        if mode == "string" and payload_size > 110 and not has_overflow:
             print("\n[WARNING] String mode sends 2 packets back ('Echo: ' and your string).")
             print(f"To avoid MCU TX ring buffer (128B) overflow, payload size is capped at 110.")
             payload_size = 110
@@ -206,133 +212,137 @@ class UARTTestbench:
         print(f"  Port:           {self._port_name}")
         print(f"  Baud Rate:      {self._baudrate}")
         print(f"  Test Mode:      {mode.upper()}")
-        print(f"  Packets:        {num_packets}")
-        print(f"  Payload Size:   {payload_size} bytes")
+        print(f"  Modifiers:      {', '.join(modifiers).upper() if modifiers else 'NONE'}")
+        print(f"  Transactions:   {num_packets}")
+        print(f"  Payload Size:   {'150 (OVERFLOW)' if has_overflow else payload_size} bytes")
         print(f"  Verbose Mode:   {'YES' if verbose else 'NO'}")
         print("=" * 72)
         print()
 
         progress_interval = max(1, num_packets // 20)
+        import random
+
+        burst_size = 5 if has_burst else 1
 
         for i in range(num_packets):
-            if mode == "binary":
-                payload = bytearray(((i + j) & 0xFF) for j in range(payload_size))
-            else:
-                # String mode - send formatted ASCII string
-                # We can occasionally send commands like "LED_ON" to test the command parser
-                if i % 100 == 10:
-                    payload_str = "LED_ON"
-                elif i % 100 == 40:
-                    payload_str = "TEST_CAPACITY"
-                elif i % 100 == 60:
-                    payload_str = "LED_OFF"
+            tx_data = bytearray()
+            payloads = []
+
+            for b_idx in range(burst_size):
+                actual_i = i * burst_size + b_idx
+                current_payload_size = 150 if has_overflow else payload_size
+
+                if mode == "binary":
+                    payload = bytearray(((actual_i + j) & 0xFF) for j in range(current_payload_size))
                 else:
-                    payload_str = f"Msg#{i}".ljust(payload_size, "_")
+                    if actual_i % 100 == 10:
+                        payload_str = "LED_ON"
+                    elif actual_i % 100 == 40:
+                        payload_str = "TEST_CAPACITY"
+                    elif actual_i % 100 == 60:
+                        payload_str = "LED_OFF"
+                    else:
+                        payload_str = f"Msg#{actual_i}".ljust(current_payload_size, "_")
+                    payload_str = payload_str[:current_payload_size]
+                    payload = payload_str.encode('ascii')
+
+                payloads.append(payload)
                 
-                # Truncate string to exact payload size if it's too long
-                payload_str = payload_str[:payload_size]
-                payload = payload_str.encode('ascii')
+                try:
+                    packet = self.build_packet(payload)
+                except ValueError as e:
+                    # MAX_PAYLOAD_LEN is 255, overflow is 150, so this won't raise, but just in case
+                    packet = bytearray()
+
+                if has_noise:
+                    noise_before = bytearray(random.randint(0, 255) for _ in range(5))
+                    noise_after = bytearray(random.randint(0, 255) for _ in range(5))
+                    packet = noise_before + packet + noise_after
+
+                tx_data.extend(packet)
 
             if verbose:
-                if mode == "binary":
-                    print(f"\n[Packet #{i+1}] Sending: {payload.hex(' ').upper()}")
-                else:
-                    print(f"\n[Packet #{i+1}] Sending: '{payload.decode('ascii')}'")
+                print(f"\n[Transaction #{i+1}] Sending {len(tx_data)} bytes in burst of {burst_size} packets...")
 
             try:
-                bytes_written = self.send_packet(payload)
-                metrics.total_sent += 1
+                if has_fragmented:
+                    for byte in tx_data:
+                        self._serial.write(bytes([byte]))
+                        self._serial.flush()
+                        time.sleep(0.002)
+                    bytes_written = len(tx_data)
+                else:
+                    bytes_written = self._serial.write(tx_data)
+                    self._serial.flush()
+                
                 metrics.bytes_transmitted += bytes_written
 
-                # Wait for response(s)
-                if mode == "string":
-                    is_cmd = payload.decode('ascii') in ("LED_ON", "LED_OFF", "TEST_CAPACITY")
+                # Wait for response(s) for EACH payload in the burst
+                for p_idx, payload in enumerate(payloads):
+                    metrics.total_sent += 1
                     
-                    if is_cmd:
-                        # Commands only reply with one string packet
+                    if mode == "string":
+                        is_cmd = payload.decode('ascii') in ("LED_ON", "LED_OFF", "TEST_CAPACITY")
+                        if is_cmd:
+                            is_valid, rx_payload, debug_msg = self.receive_packet()
+                            if is_valid:
+                                rx_str = rx_payload.decode('ascii', errors='replace')
+                                if payload.decode('ascii') == "LED_ON":
+                                    expected_str = "LED is now ON"
+                                elif payload.decode('ascii') == "LED_OFF":
+                                    expected_str = "LED is now OFF"
+                                else:
+                                    expected_str = "C" * 110
+                                    
+                                if rx_str == expected_str:
+                                    metrics.successful += 1
+                                    if verbose: print(f"  [{p_idx+1}/{burst_size}] Command OK! Got: '{rx_str}'")
+                                else:
+                                    metrics.checksum_errors += 1
+                                    if verbose: print(f"  [{p_idx+1}/{burst_size}] BAD RESPONSE. Expected '{expected_str}', got '{rx_str}'")
+                            else:
+                                metrics.timeouts += 1
+                                if verbose: print(f"  [{p_idx+1}/{burst_size}] ERROR: {debug_msg}")
+                        else:
+                            is_valid1, rx1, msg1 = self.receive_packet()
+                            is_valid2, rx2, msg2 = self.receive_packet()
+                            
+                            if is_valid1 and is_valid2:
+                                str1 = rx1.decode('ascii', errors='replace')
+                                str2 = rx2.decode('ascii', errors='replace')
+                                if str1 == "Echo: " and str2 == payload.decode('ascii'):
+                                    metrics.successful += 1
+                                    if verbose: print(f"  [{p_idx+1}/{burst_size}] Echo OK! Got: '{str1}' and '{str2}'")
+                                else:
+                                    metrics.checksum_errors += 1
+                                    if verbose: print(f"  [{p_idx+1}/{burst_size}] MISMATCH. Got '{str1}' & '{str2}'")
+                            else:
+                                if "TIMEOUT" in msg1 or "TIMEOUT" in msg2:
+                                    metrics.timeouts += 1
+                                else:
+                                    metrics.checksum_errors += 1
+                                if verbose: print(f"  [{p_idx+1}/{burst_size}] RX FAIL. Pkt 1: {msg1}, Pkt 2: {msg2}")
+                    else:
                         is_valid, rx_payload, debug_msg = self.receive_packet()
                         if is_valid:
-                            rx_str = rx_payload.decode('ascii', errors='replace')
-                            if payload.decode('ascii') == "LED_ON":
-                                expected_str = "LED is now ON"
-                            elif payload.decode('ascii') == "LED_OFF":
-                                expected_str = "LED is now OFF"
-                            else:
-                                expected_str = "C" * 110
-                                
-                            if rx_str == expected_str:
+                            if rx_payload == payload:
                                 metrics.successful += 1
-                                if verbose:
-                                    print(f"[Packet #{i+1}] Command OK! Got: '{rx_str}'")
-                                else:
-                                    # Print cleanly above progress bar
-                                    sys.stdout.write(f"\r\033[K[MCU Reply]: {rx_str}\n")
+                                if verbose: print(f"  [{p_idx+1}/{burst_size}] Echo OK! Payload: {rx_payload.hex(' ').upper()}")
                             else:
                                 metrics.checksum_errors += 1
-                                if verbose:
-                                    print(f"[Packet #{i+1}] BAD RESPONSE. Expected '{expected_str}', got '{rx_str}'")
-                                else:
-                                    sys.stdout.write(f"\r\033[K[MCU Reply Error]: Expected '{expected_str}', got '{rx_str}'\n")
+                                if verbose: print(f"  [{p_idx+1}/{burst_size}] DATA MISMATCH! Expected {payload.hex(' ').upper()}")
                         else:
-                            metrics.timeouts += 1
-                            if verbose: print(f"[Packet #{i+1}] ERROR: {debug_msg}")
-                    else:
-                        # Normal strings reply with TWO packets: "Echo: " and the string itself
-                        is_valid1, rx1, msg1 = self.receive_packet()
-                        is_valid2, rx2, msg2 = self.receive_packet()
-                        
-                        if is_valid1 and is_valid2:
-                            str1 = rx1.decode('ascii', errors='replace')
-                            str2 = rx2.decode('ascii', errors='replace')
-                            if str1 == "Echo: " and str2 == payload.decode('ascii'):
-                                metrics.successful += 1
-                                if verbose:
-                                    print(f"[Packet #{i+1}] Echo OK! Got: '{str1}' and '{str2}'")
-                                else:
-                                    sys.stdout.write(f"\r\033[K[MCU Echo]: {str2}\n")
-                            else:
-                                metrics.checksum_errors += 1
-                                if verbose:
-                                    print(f"[Packet #{i+1}] MISMATCH. Got '{str1}' & '{str2}'")
-                                else:
-                                    sys.stdout.write(f"\r\033[K[MCU Echo Mismatch]: Got '{str1}' & '{str2}'\n")
-                        else:
-                            if "TIMEOUT" in msg1 or "TIMEOUT" in msg2:
+                            if "TIMEOUT" in debug_msg:
                                 metrics.timeouts += 1
                             else:
                                 metrics.checksum_errors += 1
-                            if verbose:
-                                print(f"[Packet #{i+1}] RX FAIL. Packet 1: {msg1}, Packet 2: {msg2}")
-                                
-                else:
-                    # Binary mode - expect exact echo of bytes
-                    is_valid, rx_payload, debug_msg = self.receive_packet()
-                    
-                    if is_valid:
-                        if rx_payload == payload:
-                            metrics.successful += 1
-                            if verbose:
-                                print(f"[Packet #{i+1}] Echo OK!    Payload: {rx_payload.hex(' ').upper()}")
-                        else:
-                            metrics.checksum_errors += 1
-                            if verbose:
-                                print(f"[Packet #{i+1}] DATA MISMATCH! Expected {payload.hex(' ').upper()}, got {rx_payload.hex(' ').upper() if rx_payload else 'None'}")
-                    else:
-                        if "TIMEOUT" in debug_msg:
-                            metrics.timeouts += 1
-                        else:
-                            metrics.checksum_errors += 1
-                            
-                        if verbose:
-                            print(f"[Packet #{i+1}] {debug_msg}")
-                            if rx_payload:
-                                print(f"[Packet #{i+1}] Faulty Payload: {rx_payload.hex(' ').upper()}")
+                            if verbose: print(f"  [{p_idx+1}/{burst_size}] {debug_msg}")
 
             except serial.SerialException as exc:
-                metrics.total_sent += 1
-                metrics.timeouts += 1
+                metrics.total_sent += burst_size
+                metrics.timeouts += burst_size
                 if verbose:
-                    print(f"\n[ERROR] Serial exception on packet #{i + 1}: {exc}")
+                    print(f"\n[ERROR] Serial exception on transaction #{i + 1}: {exc}")
 
             if not verbose and ((i + 1) % progress_interval == 0 or (i + 1) == num_packets):
                 pct = (i + 1) / num_packets * 100
@@ -442,7 +452,11 @@ def get_test_config() -> dict:
             print(f"  [!] Please select one of: {choices_str}")
 
     mode = ask_choice("Test Mode", ["Binary", "String"], "String")
-    num_packets = ask_int("Number of packets to send", 1000, 1, 1_000_000)
+    
+    modifiers_raw = input("  Chaos Modifiers (comma-separated: Fragmented,Burst,Noise,Overflow) [None]: ").strip().lower()
+    modifiers = [m.strip() for m in modifiers_raw.split(',')] if modifiers_raw else []
+    
+    num_packets = ask_int("Number of transactions (bursts) to send", 1000, 1, 1_000_000)
     payload_size = ask_int("Payload size (bytes)", 8, 1, MAX_PAYLOAD_LEN)
     baudrate = ask_int("Baud rate", DEFAULT_BAUD, 1200, 3_000_000)
     verbose = ask_bool("Enable verbose debug visualization?", False)
@@ -450,6 +464,7 @@ def get_test_config() -> dict:
     print()
     return {
         "mode": mode,
+        "modifiers": modifiers,
         "num_packets": num_packets,
         "payload_size": payload_size,
         "baudrate": baudrate,
@@ -483,6 +498,7 @@ def main() -> None:
             num_packets=config["num_packets"],
             payload_size=config["payload_size"],
             mode=config["mode"],
+            modifiers=config["modifiers"],
             verbose=config["verbose"],
         )
 

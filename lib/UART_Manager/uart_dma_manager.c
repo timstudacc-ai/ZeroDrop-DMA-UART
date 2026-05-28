@@ -1,0 +1,135 @@
+#include "uart_dma_manager.h"
+#include "dma.h"
+#include <stdbool.h>
+
+#define ENABLE_HW_FLOW_CONTROL 0 /* Встановіть 1, щоб увімкнути RTS/CTS керування потоком */
+#define RX_BUFFER_WATERMARK 32
+
+/* Encapsulated static state for the UART DMA Manager */
+static UART_HandleTypeDef *p_huart = NULL;
+static RingBuffer *p_rx_buf = NULL;
+static RingBuffer *p_tx_buf = NULL;
+
+static uint8_t rx_dma_buf[128];
+static uint8_t tx_buf_A[128];
+static uint8_t tx_buf_B[128];
+
+static volatile bool tx_dma_busy = false;
+static volatile uint8_t tx_active_buf = 0; /* 0 = tx_buf_A active, 1 = tx_buf_B active */
+
+HAL_StatusTypeDef UART_Manager_Init(UART_HandleTypeDef *huart, RingBuffer *rx_ptr, RingBuffer *tx_ptr)
+{
+    if (huart == NULL || rx_ptr == NULL || tx_ptr == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    p_huart = huart;
+    p_rx_buf = rx_ptr;
+    p_tx_buf = tx_ptr;
+
+    #if ENABLE_HW_FLOW_CONTROL
+      HW_CONTROL_ON(p_huart);
+    #else
+      HW_CONTROL_OFF(p_huart);
+    #endif
+
+    return HAL_UARTEx_ReceiveToIdle_DMA(p_huart, rx_dma_buf, sizeof(rx_dma_buf));
+}
+
+void UART_Manager_Task(void)
+{
+    if (p_huart == NULL || p_rx_buf == NULL || p_tx_buf == NULL)
+    {
+        return;
+    }
+
+    #if ENABLE_HW_FLOW_CONTROL
+    /* 1. Hardware RX Flow Control */
+    uint16_t rx_count = rb_get_count(p_rx_buf);
+    uint16_t rx_free = (RING_BUFFER_SIZE - 1) - rx_count;
+    
+    if (rx_free < RX_BUFFER_WATERMARK)
+    {
+        if (READ_BIT(p_huart->Instance->CR1, USART_CR1_RE))
+        {
+            CLEAR_BIT(p_huart->Instance->CR1, USART_CR1_RE);
+        }
+    }
+    else
+    {
+        if (!READ_BIT(p_huart->Instance->CR1, USART_CR1_RE))
+        {
+            SET_BIT(p_huart->Instance->CR1, USART_CR1_RE);
+        }
+    }
+    #endif
+
+    /* 2. DMA TX Kick-off */
+    NVIC_DisableIRQ(DMA2_Stream7_IRQn);
+    NVIC_DisableIRQ(USART1_IRQn);
+    if (!tx_dma_busy && !rb_is_empty(p_tx_buf))
+    {
+        uint16_t tx_len = rb_pop_array(p_tx_buf, tx_buf_A, sizeof(tx_buf_A));
+        if (tx_len > 0)
+        {
+            tx_dma_busy = true;
+            tx_active_buf = 0;
+            HAL_UART_Transmit_DMA(p_huart, tx_buf_A, tx_len);
+        }
+    }
+    NVIC_EnableIRQ(USART1_IRQn);
+    NVIC_EnableIRQ(DMA2_Stream7_IRQn);
+}
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+    if (p_huart != NULL && huart->Instance == p_huart->Instance)
+    {
+        rb_push_array(p_rx_buf, rx_dma_buf, Size);
+        HAL_UART_AbortReceive(p_huart);
+        HAL_UARTEx_ReceiveToIdle_DMA(p_huart, rx_dma_buf, sizeof(rx_dma_buf));
+    }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (p_huart != NULL && huart->Instance == p_huart->Instance)
+    {
+        if (tx_active_buf == 0)
+        {
+            uint16_t len = rb_pop_array(p_tx_buf, tx_buf_B, sizeof(tx_buf_B));
+            if (len > 0)
+            {
+                tx_active_buf = 1;
+                HAL_UART_Transmit_DMA(p_huart, tx_buf_B, len);
+            }
+            else
+            {
+                tx_dma_busy = false;
+            }
+        }
+        else
+        {
+            uint16_t len = rb_pop_array(p_tx_buf, tx_buf_A, sizeof(tx_buf_A));
+            if (len > 0)
+            {
+                tx_active_buf = 0;
+                HAL_UART_Transmit_DMA(p_huart, tx_buf_A, len);
+            }
+            else
+            {
+                tx_dma_busy = false;
+            }
+        }
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (p_huart != NULL && huart->Instance == p_huart->Instance)
+    {
+        HAL_UART_AbortReceive(p_huart);
+        HAL_UARTEx_ReceiveToIdle_DMA(p_huart, rx_dma_buf, sizeof(rx_dma_buf));
+    }
+}

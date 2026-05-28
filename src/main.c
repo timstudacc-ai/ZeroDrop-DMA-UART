@@ -24,6 +24,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "dma.h"
+#include "crc.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -43,7 +44,8 @@
 #include "uart_ring_buffer.h"
 #include "packet_protocol.h"
 #define RX_BUFFER_WATERMARK 32
-#define TX_BUFFER_WATERMARK 120
+#define TX_BUFFER_WATERMARK 32
+#define ENABLE_HW_FLOW_CONTROL 0 /* Встановіть 1, щоб увімкнути RTS/CTS керування потоком */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -108,11 +110,19 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
+  MX_CRC_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   /* Initialize ring buffers */
   rb_init(&rx_buffer);
   rb_init(&tx_buffer);
+
+  /* Конфігурація апаратного керування потоком на основі макросу */
+  #if ENABLE_HW_FLOW_CONTROL
+    HW_CONTROL_ON(&huart1);
+  #else
+    HW_CONTROL_OFF(&huart1);
+  #endif
 
   /* Start DMA reception with IDLE Line Detection */
   HAL_UARTEx_ReceiveToIdle_DMA(&huart1, rx_dma_buf, sizeof(rx_dma_buf));
@@ -128,6 +138,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     
+    #if ENABLE_HW_FLOW_CONTROL
     /* 1. Hardware RX Flow Control 
      * Toggle UART Receiver Enable (RE) bit based on rx_buffer free space.
      * Disabling RE forces the hardware RTS pin high (inactive).
@@ -149,7 +160,8 @@ int main(void)
         SET_BIT(huart1.Instance->CR1, USART_CR1_RE);
       }
     }
-
+    #endif
+  
     /* 2. Software TX Flow Control (Option 2)
      * Only process incoming packets if we have enough space in the TX buffer 
      * to safely store the maximum possible response. 
@@ -166,51 +178,35 @@ int main(void)
       {
       my_payload[len] = '\0'; /* Null terminate in case it is a string */
 
-      /* 1. Determine if the payload is a string or a raw binary array.
-         If all characters are printable ASCII (32-126), we treat it as a String.
-         Otherwise, we treat it as a raw binary array. */
-      bool is_string = true;
-      for (uint16_t i = 0; i < len; i++)
+      /* Process known string commands or default to binary echo */
+      if (strcmp((char *)my_payload, "LED_ON") == 0)
       {
-        if (my_payload[i] < 32 || my_payload[i] > 126)
-        {
-          is_string = false;
-          break;
-        }
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET); /* Turn ON LED (active low) */
+        pkt_push_string_crc(&tx_buffer, 0xAA, "LED is now ON");
       }
-
-      if (is_string)
+      else if (strcmp((char *)my_payload, "LED_OFF") == 0)
       {
-        /* --- DEMONSTRATION OF STRING HANDLING --- */
-        if (strcmp((char *)my_payload, "LED_ON") == 0)
-        {
-          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET); /* Turn ON LED (active low) */
-          pkt_push_string_crc(&tx_buffer, 0xAA, "LED is now ON");
-        }
-        else if (strcmp((char *)my_payload, "LED_OFF") == 0)
-        {
-          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET); /* Turn OFF LED */
-          pkt_push_string_crc(&tx_buffer, 0xAA, "LED is now OFF");
-        }
-        else if (strcmp((char *)my_payload, "TEST_CAPACITY") == 0)
-        {
-          /* Generate a 110 character string to test tx_buffer capacity */
-          char cap_test[120];
-          memset(cap_test, 'C', 110);
-          cap_test[110] = '\0';
-          pkt_push_string_crc(&tx_buffer, 0xAA, cap_test);
-        }
-        else
-        {
-          /* Echo the string back with a prefix */
-          pkt_push_string_crc(&tx_buffer, 0xAA, "Echo: ");
-          pkt_push_string_crc(&tx_buffer, 0xAA, (char *)my_payload);
-        }
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET); /* Turn OFF LED */
+        pkt_push_string_crc(&tx_buffer, 0xAA, "LED is now OFF");
+      }
+      else if (strcmp((char *)my_payload, "TEST_CAPACITY") == 0)
+      {
+        /* Generate a 110 character string to test tx_buffer capacity */
+        char cap_test[120];
+        memset(cap_test, 'C', 110);
+        cap_test[110] = '\0';
+        pkt_push_string_crc(&tx_buffer, 0xAA, cap_test);
+      }
+      else if (strncmp((char *)my_payload, "Msg#", 4) == 0)
+      {
+        /* Echo the string back with a prefix */
+        pkt_push_string_crc(&tx_buffer, 0xAA, "Echo: ");
+        pkt_push_string_crc(&tx_buffer, 0xAA, (char *)my_payload);
       }
       else
       {
-        /* --- DEMONSTRATION OF RAW BINARY ARRAY HANDLING --- */
-        /* Echo the raw binary array exactly as received without string processing */
+        /* --- RAW BINARY ARRAY HANDLING --- */
+        /* Echo the raw binary array exactly as received */
         pkt_push_binary_packet_crc(&tx_buffer, 0xAA, my_payload, len);
       }
       }

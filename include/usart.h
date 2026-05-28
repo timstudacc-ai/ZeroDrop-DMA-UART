@@ -41,7 +41,8 @@ extern UART_HandleTypeDef huart1;
 void MX_USART1_UART_Init(void);
 
 /* USER CODE BEGIN Prototypes */
-
+void HW_CONTROL_ON(UART_HandleTypeDef *huart);
+void HW_CONTROL_OFF(UART_HandleTypeDef *huart);
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

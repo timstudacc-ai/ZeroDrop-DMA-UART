@@ -255,11 +255,11 @@ class UARTTestbench:
                 if mode == "binary":
                     payload = bytearray(((actual_i + j) & 0xFF) for j in range(current_payload_size))
                 else:
-                    if actual_i % 100 == 10:
+                    if actual_i % 100 == 10 and current_payload_size >= 6:
                         payload_str = "LED_ON"
-                    elif actual_i % 100 == 40:
+                    elif actual_i % 100 == 40 and current_payload_size >= 13:
                         payload_str = "TEST_CAPACITY"
-                    elif actual_i % 100 == 60:
+                    elif actual_i % 100 == 60 and current_payload_size >= 7:
                         payload_str = "LED_OFF"
                     else:
                         payload_str = f"Msg#{actual_i}".ljust(current_payload_size, "_")
@@ -330,7 +330,8 @@ class UARTTestbench:
                             if is_valid1 and is_valid2:
                                 str1 = rx1.decode('ascii', errors='replace')
                                 str2 = rx2.decode('ascii', errors='replace')
-                                if str1 == "Echo: " and str2 == payload.decode('ascii'):
+                                # Resync logic: if it matches any payload in the burst, it's valid!
+                                if str1 == "Echo: " and any(str2 == p.decode('ascii') for p in payloads):
                                     metrics.successful += 1
                                     if verbose: print(f"  [{p_idx+1}/{burst_size}] Echo OK! Got: '{str1}' and '{str2}'")
                                 else:
@@ -345,7 +346,8 @@ class UARTTestbench:
                     else:
                         is_valid, rx_payload, debug_msg = self.receive_packet()
                         if is_valid:
-                            if rx_payload == payload:
+                            # Resync logic: if it matches any payload in the burst, it's valid!
+                            if rx_payload in payloads:
                                 metrics.successful += 1
                                 if verbose: print(f"  [{p_idx+1}/{burst_size}] Echo OK! Payload: {rx_payload.hex(' ').upper()}")
                             else:
@@ -471,10 +473,26 @@ def get_test_config() -> dict:
                 return raw
             print(f"  [!] Please select one of: {choices_str}")
 
-    mode = ask_choice("Test Mode", ["Binary", "String"], "String")
+    print("\n  Test Modes:")
+    print("  [1] Binary")
+    print("  [2] String")
+    mode_input = input("  Select Test Mode [2]: ").strip()
+    mode = "binary" if mode_input == "1" else "string"
     
-    modifiers_raw = input("  Chaos Modifiers (comma-separated: Fragmented,Burst,Noise,Overflow) [None]: ").strip().lower()
-    modifiers = [m.strip() for m in modifiers_raw.split(',')] if modifiers_raw else []
+    print("\n  Chaos Modifiers:")
+    print("  [1] Fragmented")
+    print("  [2] Burst")
+    print("  [3] Noise")
+    print("  [4] Overflow")
+    mod_input = input("  Select Modifiers (comma-separated, e.g., 1,2) [None]: ").strip()
+    
+    modifier_map = {"1": "fragmented", "2": "burst", "3": "noise", "4": "overflow"}
+    modifiers = []
+    if mod_input:
+        for m in mod_input.split(','):
+            m = m.strip()
+            if m in modifier_map:
+                modifiers.append(modifier_map[m])
     
     num_packets = ask_int("Number of transactions (bursts) to send", 1000, 1, 1_000_000)
     payload_size = ask_int("Payload size (bytes)", 8, 1, MAX_PAYLOAD_LEN)

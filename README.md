@@ -93,11 +93,14 @@ The size of the ring buffers can be easily customized by modifying `RING_BUFFER_
 
 ## 2. Cascading RTS/CTS Flow Control
 
-To guarantee zero data loss even under extreme load or when the application is busy, this driver implements a fully integrated hardware/software flow control cascade:
+> [!TIP]
+> **Dynamic Configuration:** The hardware flow control (RTS/CTS) mechanism can be explicitly enabled or disabled at compile-time via a configuration macro. This provides flexibility to toggle flow control on or off depending on the remote device's capabilities.
 
-1. **Hardware RX Flow Control (Option 1):** The `main.c` loop monitors `rx_buffer` free space. If it drops below `RX_BUFFER_WATERMARK`, it temporarily clears the UART Receiver Enable (`RE`) bit. This forces the STM32's hardware to de-assert the **RTS** pin, safely instructing the remote device to halt transmission before our software buffer overflows.
-2. **Software TX Flow Control (Option 2):** Before processing incoming packets, the application checks `tx_buffer` free space against `TX_BUFFER_WATERMARK`. If there isn't enough space for a response, it pauses processing, causing `rx_buffer` to fill up and naturally trigger the Hardware RX Flow Control.
-3. **Hardware TX Flow Control (Option 3):** If the remote device de-asserts its RTS (our **CTS** pin), the STM32 hardware automatically pauses UART TX DMA transfers. This causes our `tx_buffer` to fill up, which triggers the Software TX Flow Control, which ultimately halts reception via RTS.
+To guarantee zero data loss even under extreme load or when the application is busy, this driver implements a fully integrated hardware/software flow control cascade (when enabled):
+
+1. **Hardware RX Flow Control (Option 1):** The main loop monitors the RX buffer free space. If it drops below the watermark, it temporarily clears the UART Receiver Enable (`RE`) bit. This forces the STM32's hardware to de-assert the **RTS** pin, safely instructing the remote device to halt transmission before our software buffer overflows.
+2. **Software TX Flow Control (Option 2):** Before processing incoming packets, the application checks the TX buffer free space against the watermark. If there isn't enough space for a response, it pauses processing, causing the RX buffer to fill up and naturally trigger the Hardware RX Flow Control.
+3. **Hardware TX Flow Control (Option 3):** If the remote device de-asserts its RTS (our **CTS** pin), the STM32 hardware automatically pauses UART TX DMA transfers. This causes our TX buffer to fill up, which triggers the Software TX Flow Control, which ultimately halts reception via RTS.
 
 This creates a perfect backpressure mechanism stretching from the remote device's RX buffer all the way back to the remote device's TX buffer, ensuring completely lossless communication.
 

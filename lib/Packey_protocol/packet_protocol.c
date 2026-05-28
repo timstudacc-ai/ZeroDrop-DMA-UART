@@ -64,6 +64,17 @@ uint16_t pkt_pop_binary_packet_crc(RingBuffer *rb, uint8_t start_byte, uint8_t *
     uint16_t len_idx = (rb->tail + 1) % RING_BUFFER_SIZE;
     uint8_t payload_len = rb->buffer[len_idx]; 
 
+    /* BOUNDS CHECK: If the requested length makes the packet larger than
+     * the physical capacity of the ring buffer, it is impossible to ever receive.
+     * This means the start byte was falsely identified or data was dropped.
+     */
+    if ((3 + payload_len) >= RING_BUFFER_SIZE)
+    {
+        uint8_t dummy;
+        rb_pop(rb, &dummy); /* Discard the corrupted start byte */
+        return 0; /* Let the next loop resynchronize */
+    }
+
     if (count < (uint16_t)(3 + payload_len))
         return 0; /* Wait for data and CRC */
 

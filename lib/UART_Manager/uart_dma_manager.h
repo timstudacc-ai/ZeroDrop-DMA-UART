@@ -20,4 +20,10 @@ HAL_StatusTypeDef UART_Manager_Init(UART_HandleTypeDef *huart, RingBuffer *rx_pt
  */
 void UART_Manager_Task(void);
 
+/**
+ * @brief Enable or disable hardware flow control (RTS/CTS logic).
+ * @param enable True to enable, False to disable.
+ */
+void UART_Manager_SetHwFlowControl(bool enable);
+
 #endif /* UART_DMA_MANAGER_H */

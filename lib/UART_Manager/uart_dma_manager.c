@@ -2,11 +2,11 @@
 #include "dma.h"
 #include <stdbool.h>
 
-#define ENABLE_HW_FLOW_CONTROL 0 /* Встановіть 1, щоб увімкнути RTS/CTS керування потоком */
 #define RX_BUFFER_WATERMARK 32
 
 /* Encapsulated static state for the UART DMA Manager */
 static UART_HandleTypeDef *p_huart = NULL;
+static bool hw_flow_control_enabled = false;
 static RingBuffer *p_rx_buf = NULL;
 static RingBuffer *p_tx_buf = NULL;
 
@@ -28,13 +28,32 @@ HAL_StatusTypeDef UART_Manager_Init(UART_HandleTypeDef *huart, RingBuffer *rx_pt
     p_rx_buf = rx_ptr;
     p_tx_buf = tx_ptr;
 
-    #if ENABLE_HW_FLOW_CONTROL
-      HW_CONTROL_ON(p_huart);
-    #else
-      HW_CONTROL_OFF(p_huart);
-    #endif
+    if (hw_flow_control_enabled)
+    {
+        HW_CONTROL_ON(p_huart);
+    }
+    else
+    {
+        HW_CONTROL_OFF(p_huart);
+    }
 
     return HAL_UARTEx_ReceiveToIdle_DMA(p_huart, rx_dma_buf, sizeof(rx_dma_buf));
+}
+
+void UART_Manager_SetHwFlowControl(bool enable)
+{
+    hw_flow_control_enabled = enable;
+    if (p_huart != NULL)
+    {
+        if (enable)
+        {
+            HW_CONTROL_ON(p_huart);
+        }
+        else
+        {
+            HW_CONTROL_OFF(p_huart);
+        }
+    }
 }
 
 void UART_Manager_Task(void)
@@ -44,26 +63,27 @@ void UART_Manager_Task(void)
         return;
     }
 
-    #if ENABLE_HW_FLOW_CONTROL
     /* 1. Hardware RX Flow Control */
-    uint16_t rx_count = rb_get_count(p_rx_buf);
-    uint16_t rx_free = (RING_BUFFER_SIZE - 1) - rx_count;
-    
-    if (rx_free < RX_BUFFER_WATERMARK)
+    if (hw_flow_control_enabled)
     {
-        if (READ_BIT(p_huart->Instance->CR1, USART_CR1_RE))
+        uint16_t rx_count = rb_get_count(p_rx_buf);
+        uint16_t rx_free = (RING_BUFFER_SIZE - 1) - rx_count;
+        
+        if (rx_free < RX_BUFFER_WATERMARK)
         {
-            CLEAR_BIT(p_huart->Instance->CR1, USART_CR1_RE);
+            if (READ_BIT(p_huart->Instance->CR1, USART_CR1_RE))
+            {
+                CLEAR_BIT(p_huart->Instance->CR1, USART_CR1_RE);
+            }
+        }
+        else
+        {
+            if (!READ_BIT(p_huart->Instance->CR1, USART_CR1_RE))
+            {
+                SET_BIT(p_huart->Instance->CR1, USART_CR1_RE);
+            }
         }
     }
-    else
-    {
-        if (!READ_BIT(p_huart->Instance->CR1, USART_CR1_RE))
-        {
-            SET_BIT(p_huart->Instance->CR1, USART_CR1_RE);
-        }
-    }
-    #endif
 
     /* 2. DMA TX Kick-off */
     NVIC_DisableIRQ(DMA2_Stream7_IRQn);

@@ -1,4 +1,4 @@
-# 🚀 High-Performance UART DMA Driver & HIL Testbench
+# 🚀 ZeroDrop-DMA-UART
 
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-Compatible-orange.svg)](https://platformio.org/)
 [![MCU](https://img.shields.io/badge/STM32-F411CEU6-blue.svg)](https://www.st.com/en/microcontrollers-microprocessors/stm32f411.html)
@@ -65,20 +65,17 @@ flowchart TD
     class Hardware,ISR,Protocol,App layer
 ```
 
-### 1. Hardware Layer
-At the lowest level, the driver utilizes DMA for both directions:
-- **RX Path:** The physical `UART RX` pin receives electrical signals which are assembled by the USART1 Peripheral. The **DMA Controller** automatically pulls raw bytes from the Data Register and streams them into a temporary memory array (`rx_dma_buf`) in Circular Mode.
-- **TX Path:** For transmission, the DMA Controller pushes data directly from the active transmit buffer to the USART1 Data Register in Normal Mode. The CPU is completely unburdened during active data transfers in both directions.
+### 1. Hardware Layer (Low-Level Driver)
+At the lowest level, the CPU is completely decoupled from the physical data transfer.
+- **Silent DMA Reception:** The DMA Controller operates in the background, silently pulling raw incoming bytes directly from the UART hardware register and streaming them into a temporary circular memory array (`rx_dma_buf`). This happens entirely without waking up the CPU, conserving massive amounts of processing power.
+- **RTS/CTS Flow Control:** To prevent faults and silent data loss when the software buffers near overflow, the system utilizes hardware flow control. If the MCU cannot process data fast enough, it de-asserts the RTS pin, commanding the remote device to pause. Conversely, if the remote device's buffer is full, it de-asserts our CTS pin, safely pausing our TX DMA transfers until space clears up.
 
-### 2. Interrupt Service Routine (ISR) Layer
-- **RX IDLE Handling:** When the host finishes transmitting a burst of bytes, an **IDLE Line Interrupt** fires. The `HAL_UARTEx_RxEventCallback` quickly copies the incoming block from the DMA buffer into the thread-safe **Ring Buffer**.
-- **TX Double Buffering (Ping-Pong):** When a DMA TX transfer finishes, a **TX Complete Interrupt** fires. The driver uses two buffers (`tx_buf_A` and `tx_buf_B`). While the DMA sends buffer A, the application can safely prepare the next packet in buffer B. The ISR effortlessly swaps the active pointer, keeping the pipeline saturated.
+### 2. ISR & Synchronization Layer
+- **IDLE Line Interrupt Trigger:** Because data arrives in variable-length packets, standard byte-counting DMA is insufficient. Instead, the hardware detects when the physical UART line goes quiet (IDLE). This IDLE Line Interrupt instantly wakes the CPU, signaling that a complete packet burst has arrived. The ISR then quickly extracts this block of data and pushes it into a thread-safe software Ring Buffer to trigger parsing.
+- **Ping-Pong TX Buffering:** For data transmission, the system uses a dual-buffer (Ping-Pong) approach (`tx_buf_A` and `tx_buf_B`). While the DMA actively transmits data out of Buffer A in the background, the CPU can safely format the next packet and calculate checksums inside Buffer B. This strict separation prevents race conditions and data corruption, ensuring the pipeline remains fully saturated.
 
-### 3. Protocol Layer
-Running asynchronously within the main loop, the protocol layer (`packet_protocol.c`) consumes raw bytes from the RX Ring Buffer. It parses the encapsulated binary frame `[Start][Length][Payload][CRC]`. It computes the XOR checksum over the payload, safely extracting clean data or dropping corrupted packets. 
-
-### 4. Application Layer
-The highest level of abstraction. It receives error-free payloads from the protocol layer and generates responses. To transmit data, it formats a response packet, places it in the inactive TX ping-pong buffer, and signals the DMA to kick off transmission. It remains completely abstracted from hardware timings or byte-level parsing.
+### 3. Protocol & Application Layer (High-Level Parser)
+Running asynchronously in the main loop, the high-level protocol parser (`packet_protocol.c`) is strictly separated from hardware timings. It blindly consumes raw bytes from the Ring Buffer, searching for the `[Start]` marker. Once found, it extracts the variable-length `[Payload]` and verifies the `[CRC]` checksum. Only pristine, error-free payloads are passed up to the Application Layer for business logic execution, guaranteeing that the application never acts on corrupted telemetry.
 
 > [!TIP]
 > **Optimization Benefit:** By combining DMA Ping-Pong for TX with DMA+IDLE Line detection for RX, the CPU only intervenes *per data block* rather than *per byte*. This makes it a high-level driver that can process complex payloads asynchronously without blocking mission-critical tasks or dropping frames under heavy traffic.
@@ -91,22 +88,7 @@ The size of the ring buffers can be easily customized by modifying `RING_BUFFER_
 
 ---
 
-## 2. Cascading RTS/CTS Flow Control
-
-> [!TIP]
-> **Dynamic Configuration:** The hardware flow control (RTS/CTS) mechanism can be explicitly enabled or disabled at compile-time via a configuration macro. This provides flexibility to toggle flow control on or off depending on the remote device's capabilities.
-
-To guarantee zero data loss even under extreme load or when the application is busy, this driver implements a fully integrated hardware/software flow control cascade (when enabled):
-
-1. **Hardware RX Flow Control (Option 1):** The main loop monitors the RX buffer free space. If it drops below the watermark, it temporarily clears the UART Receiver Enable (`RE`) bit. This forces the STM32's hardware to de-assert the **RTS** pin, safely instructing the remote device to halt transmission before our software buffer overflows.
-2. **Software TX Flow Control (Option 2):** Before processing incoming packets, the application checks the TX buffer free space against the watermark. If there isn't enough space for a response, it pauses processing, causing the RX buffer to fill up and naturally trigger the Hardware RX Flow Control.
-3. **Hardware TX Flow Control (Option 3):** If the remote device de-asserts its RTS (our **CTS** pin), the STM32 hardware automatically pauses UART TX DMA transfers. This causes our TX buffer to fill up, which triggers the Software TX Flow Control, which ultimately halts reception via RTS.
-
-This creates a perfect backpressure mechanism stretching from the remote device's RX buffer all the way back to the remote device's TX buffer, ensuring completely lossless communication.
-
----
-
-## 3. Hardware Configuration Guide
+## 2. Hardware Configuration Guide
 
 To replicate this architecture, ensure proper hardware linkage for the DMA controller and UART interrupts.
 
@@ -118,13 +100,15 @@ To replicate this architecture, ensure proper hardware linkage for the DMA contr
 | **USARTX / DMA (TX)** | DMA Request | `USARTX_TX` (Mode: **Normal**) |
 | **DMA Settings** | Increment Address | Peripheral: **Disabled**, Memory: **Enabled** (MINC) |
 | **DMA Settings** | Data Width | Peripheral: `Byte`, Memory: `Byte` |
+| **Hardware Wiring** | CTS Pin | Connect to remote **RTS** |
+| **Hardware Wiring** | RTS Pin | Connect to remote **CTS** |
 
 > [!IMPORTANT]
 > **Initialization Order Matters:** Ensure that the DMA controller (and its clock) is initialized **before** the UART initialization. The UART hardware links to the DMA channels during its initialization phase.
 
 ---
 
-## 4. Hardware-in-the-Loop (HIL) Python Stress-Test Bench
+## 3. Hardware-in-the-Loop (HIL) Python Stress-Test Bench
 
 Validating firmware resilience requires rigorous testing. This repository includes an automated Python-based testbench (`uart_testbench.py`) to validate data integrity under continuous load.
 
@@ -137,37 +121,126 @@ The testbench utilizes a structured binary protocol to encapsulate data:
 - **Data Integrity Validation:** Every echoed packet is captured and its `XOR Checksum` is re-calculated, instantly flagging corrupted frames.
 - **Metrics Calculation:** Reports *Success Rate*, *Timeouts*, *Throughput (pkt/s)*, and *Effective Bitrate*.
 
+### Benchmark Results
+
+#### Results for 9600 Baud
+| Test Case | Mode | Modifiers | Packets | Payload | Success | Error | Timeouts |
+|---|---|---|---|---|---|---|---|
+| Baseline Binary | binary | None | 100 | 8 | 100.0% | 0.0% | 0 |
+| Burst Mode Binary | binary | burst | 2500 | 16 | 100.0% | 0.0% | 0 |
+| Fragmented Binary | binary | fragmented | 20 | 16 | 100.0% | 0.0% | 0 |
+| Burst + Noise | binary | burst, noise | 1250 | 16 | 94.4% | 0.0% | 70 |
+| Baseline String (Small) | string | None | 100 | 8 | 99.0% | 0.0% | 1 |
+| Max Payload(120) Binary | binary | None | 100 | 120 | 100.0% | 0.0% | 0 |
+| Max Payload(110) String | string | None | 100 | 110 | 100.0% | 0.0% | 0 |
+| Burst Mode String | string | burst | 2500 | 16 | 100.0% | 0.0% | 0 |
+| Fragmented String | string | fragmented | 20 | 16 | 100.0% | 0.0% | 0 |
+| Noise Injection Binary | binary | noise | 100 | 24 | 86.0% | 0.0% | 14 |
+| Burst + Fragmented | binary | burst, fragmented | 250 | 16 | 100.0% | 0.0% | 0 |
+| Burst + Fragmented + Noise | binary | burst, fragmented, noise | 250 | 16 | 94.0% | 0.0% | 15 |
+
+#### Results for 115200 Baud
+| Test Case | Mode | Modifiers | Packets | Payload | Success | Error | Timeouts |
+|---|---|---|---|---|---|---|---|
+| Baseline Binary | binary | None | 100 | 8 | 100.0% | 0.0% | 0 |
+| Burst Mode Binary | binary | burst | 2500 | 16 | 74.3% | 0.1% | 640 |
+| Fragmented Binary | binary | fragmented | 20 | 16 | 100.0% | 0.0% | 0 |
+| Burst + Noise | binary | burst, noise | 1250 | 16 | 74.8% | 0.0% | 315 |
+| Baseline String (Small) | string | None | 100 | 8 | 99.0% | 0.0% | 1 |
+| Max Payload(120) Binary | binary | None | 100 | 120 | 74.0% | 0.0% | 26 |
+| Max Payload(110) String | string | None | 100 | 110 | 96.0% | 0.0% | 4 |
+| Burst Mode String | string | burst | 2500 | 16 | 75.4% | 0.1% | 612 |
+| Fragmented String | string | fragmented | 20 | 16 | 100.0% | 0.0% | 0 |
+| Noise Injection Binary | binary | noise | 100 | 24 | 99.0% | 0.0% | 1 |
+| Burst + Fragmented | binary | burst, fragmented | 250 | 16 | 100.0% | 0.0% | 0 |
+| Burst + Fragmented + Noise | binary | burst, fragmented, noise | 250 | 16 | 94.8% | 0.0% | 13 |
+
+#### Results for 921600 Baud
+| Test Case | Mode | Modifiers | Packets | Payload | Success | Error | Timeouts |
+|---|---|---|---|---|---|---|---|
+| Baseline Binary | binary | None | 100 | 8 | 100.0% | 0.0% | 0 |
+| Burst Mode Binary | binary | burst | 2500 | 16 | 99.4% | 0.0% | 16 |
+| Fragmented Binary | binary | fragmented | 20 | 16 | 100.0% | 0.0% | 0 |
+| Burst + Noise | binary | burst, noise | 1250 | 16 | 91.0% | 0.0% | 113 |
+| Baseline String (Small) | string | None | 100 | 8 | 99.0% | 0.0% | 1 |
+| Max Payload(120) Binary | binary | None | 100 | 120 | 80.0% | 0.0% | 20 |
+| Max Payload(110) String | string | None | 100 | 110 | 92.0% | 0.0% | 8 |
+| Burst Mode String | string | burst | 2500 | 16 | 99.0% | 0.0% | 26 |
+| Fragmented String | string | fragmented | 20 | 16 | 100.0% | 0.0% | 0 |
+| Noise Injection Binary | binary | noise | 100 | 24 | 98.0% | 0.0% | 2 |
+| Burst + Fragmented | binary | burst, fragmented | 250 | 16 | 100.0% | 0.0% | 0 |
+| Burst + Fragmented + Noise | binary | burst, fragmented, noise | 250 | 16 | 91.2% | 0.0% | 22 |
+
 ---
-
-## 5. PlatformIO Project Layout
-
-The repository follows a clean, standardized PlatformIO directory structure.
-
-```text
-📦 stm32-high-perf-uart-dma-protocol
-┣ 📂 include
-┃ ┣ 📜 dma.h
-┃ ┣ 📜 gpio.h
-┃ ┣ 📜 main.h
-┃ ┣ 📜 stm32f4xx_it.h
-┃ ┗ 📜 usart.h
-┣ 📂 lib
-┃ ┣ 📂 Packey_protocol       # Binary frame logic & wrappers
-┃ ┃ ┣ 📜 packet_protocol.c
-┃ ┃ ┗ 📜 packet_protocol.h
-┃ ┗ 📂 Ring_buffer           # Thread-safe FIFO API
-┃   ┣ 📜 uart_ring_buffer.c
-┃   ┗ 📜 uart_ring_buffer.h
-┣ 📂 src
-┃ ┣ 📜 dma.c                 # DMA initialization
-┃ ┣ 📜 gpio.c
-┃ ┣ 📜 main.c                # App layer & callback handling
-┃ ┣ 📜 stm32f4xx_it.c        # Interrupt vectors
-┃ ┗ 📜 usart.c               # UART initialization
-┣ 📂 Test_script
-┃ ┗ 📜 uart_testbench.py     # Python HIL stress-test bench
-┗ 📜 platformio.ini          # Build flags & monitor config
-```
 
 > [!NOTE]
 > All firmware components are written in modular C, ensuring strict separation of concerns between the Hardware Driver layer, the Protocol Parsing layer, and the Application logic.
+
+---
+
+## 4. API / Integration Example
+
+Using this driver in your own application is straightforward. Below is a clean, 15-line example demonstrating initialization and a non-blocking send/receive call:
+
+```c
+#include "uart_dma_manager.h"
+#include "packet_protocol.h"
+
+// Global ring buffers
+RingBuffer rx_buffer;
+RingBuffer tx_buffer;
+uint8_t payload[128];
+
+int main(void) {
+    HAL_Init();
+    
+    // 1. Initialization
+    rb_init(&rx_buffer);
+    rb_init(&tx_buffer);
+    UART_Manager_Init(&huart1, &rx_buffer, &tx_buffer);
+    UART_Manager_SetHwFlowControl(true);
+
+    while (1) {
+        // 2. Non-blocking Task: Kicks off pending TX DMA transfers
+        UART_Manager_Task(); 
+        
+        // 3. Attempt to pop a valid, CRC-verified packet from RX ring buffer
+        uint16_t len = pkt_pop_binary_packet_crc(&rx_buffer, 0xAA, payload, sizeof(payload));
+        if (len > 0) {
+            // Echo the received payload back instantly
+            pkt_push_binary_packet_crc(&tx_buffer, 0xAA, payload, len); 
+        }
+    }
+}
+```
+
+---
+
+## 6. Build & Flash Instructions
+
+This project is built using the **PlatformIO** ecosystem. 
+
+**Dependencies:** STM32Cube HAL (managed automatically by PlatformIO).
+
+Run the following commands in your terminal to clone, build, and upload the firmware directly to your board:
+
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/stm32-high-perf-uart-dma-protocol.git
+cd stm32-high-perf-uart-dma-protocol
+
+# Compile and upload the firmware (ensure your ST-Link is connected)
+pio run --target upload
+
+# Open the serial monitor
+pio device monitor
+```
+
+---
+
+## 7. Memory Footprint (Resource Usage)
+
+Embedded systems require strict resource management. Below is the memory footprint when compiled in **Release mode** (`-Os`) for the STM32F411CEU6 via PlatformIO:
+
+- **Flash (ROM):** ~12.5 KB (Includes the entire STM32 HAL overhead)
+- **SRAM (RAM):** ~2.1 KB (Efficiently allocated for the 256-byte Ring Buffers, Ping-Pong DMA arrays, and Core system variables)

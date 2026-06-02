@@ -44,6 +44,7 @@
 #include "uart_ring_buffer.h"
 #include "packet_protocol.h"
 #include "uart_dma_manager.h"
+#define ENABLE_HW_FLOW_CONTROL 1 /* Встановіть 1, щоб увімкнути RTS/CTS керування потоком */
 #define TX_BUFFER_WATERMARK 32
 /* USER CODE END PD */
 
@@ -58,7 +59,7 @@
 /* Ring buffer instances (RX and TX) */
 RingBuffer rx_buffer;
 RingBuffer tx_buffer;
-uint8_t my_payload[128]; /* Buffer for storing unpacked payload after CRC validation */
+uint8_t my_payload[256]; /* Buffer for storing unpacked payload after CRC validation */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -125,6 +126,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    UART_Manager_SetHwFlowControl(true); /* Enable hardware flow control (RTS/CTS) */
     UART_Manager_Task();
     
     /* 2. Software TX Flow Control (Option 2)

@@ -12,7 +12,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#define RING_BUFFER_SIZE 128
+#define RING_BUFFER_SIZE 512
 /**
  * @brief Structure representing a circular buffer.
  */

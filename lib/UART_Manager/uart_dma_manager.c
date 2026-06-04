@@ -10,10 +10,11 @@ static UART_HandleTypeDef *p_huart = NULL;
 static RingBuffer *p_rx_buf = NULL;
 static RingBuffer *p_tx_buf = NULL;
 
-static uint8_t rx_dma_buf[128];
-static uint8_t tx_buf_A[128];
-static uint8_t tx_buf_B[128];
+static uint8_t rx_dma_buf[256];
+static uint8_t tx_buf_A[256];
+static uint8_t tx_buf_B[256];
 
+static uint16_t rx_old_pos = 0;
 static volatile bool tx_dma_busy = false;
 static volatile uint8_t tx_active_buf = 0; /* 0 = tx_buf_A active, 1 = tx_buf_B active */
 
@@ -28,12 +29,7 @@ HAL_StatusTypeDef UART_Manager_Init(UART_HandleTypeDef *huart, RingBuffer *rx_pt
     p_rx_buf = rx_ptr;
     p_tx_buf = tx_ptr;
 
-    #if ENABLE_HW_FLOW_CONTROL
-      HW_CONTROL_ON(p_huart);
-    #else
-      HW_CONTROL_OFF(p_huart);
-    #endif
-
+    rx_old_pos = 0;
     return HAL_UARTEx_ReceiveToIdle_DMA(p_huart, rx_dma_buf, sizeof(rx_dma_buf));
 }
 
@@ -43,27 +39,6 @@ void UART_Manager_Task(void)
     {
         return;
     }
-
-    #if ENABLE_HW_FLOW_CONTROL
-    /* 1. Hardware RX Flow Control */
-    uint16_t rx_count = rb_get_count(p_rx_buf);
-    uint16_t rx_free = (RING_BUFFER_SIZE - 1) - rx_count;
-    
-    if (rx_free < RX_BUFFER_WATERMARK)
-    {
-        if (READ_BIT(p_huart->Instance->CR1, USART_CR1_RE))
-        {
-            CLEAR_BIT(p_huart->Instance->CR1, USART_CR1_RE);
-        }
-    }
-    else
-    {
-        if (!READ_BIT(p_huart->Instance->CR1, USART_CR1_RE))
-        {
-            SET_BIT(p_huart->Instance->CR1, USART_CR1_RE);
-        }
-    }
-    #endif
 
     /* 2. DMA TX Kick-off */
     NVIC_DisableIRQ(DMA2_Stream7_IRQn);
@@ -86,9 +61,44 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     if (p_huart != NULL && huart->Instance == p_huart->Instance)
     {
-        rb_push_array(p_rx_buf, rx_dma_buf, Size);
-        HAL_UART_AbortReceive(p_huart);
-        HAL_UARTEx_ReceiveToIdle_DMA(p_huart, rx_dma_buf, sizeof(rx_dma_buf));
+        uint16_t new_pos = Size;
+        
+        if (new_pos != rx_old_pos)
+        {
+            if (new_pos > rx_old_pos)
+            {
+                uint16_t len = new_pos - rx_old_pos;
+                rb_push_array(p_rx_buf, &rx_dma_buf[rx_old_pos], len);
+            }
+            else
+            {
+                /* Wrap-around detected */
+                uint16_t len1 = sizeof(rx_dma_buf) - rx_old_pos;
+                if (len1 > 0)
+                {
+                    rb_push_array(p_rx_buf, &rx_dma_buf[rx_old_pos], len1);
+                }
+                if (new_pos > 0)
+                {
+                    rb_push_array(p_rx_buf, rx_dma_buf, new_pos);
+                }
+            }
+            
+            rx_old_pos = new_pos;
+            if (rx_old_pos >= sizeof(rx_dma_buf))
+            {
+                rx_old_pos = 0;
+            }
+        }
+
+        /* HACK: Fix the STM32 HAL IDLE bug natively in the interrupt. 
+         * If HAL sets state to READY, we manually force it back to BUSY_RX 
+         * and re-enable the IDLE interrupt bit so the Circular DMA never drops a byte. */
+        if (huart->RxState == HAL_UART_STATE_READY)
+        {
+            huart->RxState = HAL_UART_STATE_BUSY_RX;
+            SET_BIT(huart->Instance->CR1, USART_CR1_IDLEIE);
+        }
     }
 }
 
@@ -130,6 +140,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     if (p_huart != NULL && huart->Instance == p_huart->Instance)
     {
         HAL_UART_AbortReceive(p_huart);
+        rx_old_pos = 0;
         HAL_UARTEx_ReceiveToIdle_DMA(p_huart, rx_dma_buf, sizeof(rx_dma_buf));
     }
 }

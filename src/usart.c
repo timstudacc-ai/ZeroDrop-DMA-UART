@@ -41,12 +41,12 @@ void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 921600;
+  huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
   huart1.Init.Mode = UART_MODE_TX_RX;
-  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE; /* Changed to NONE to fix the floating CTS bug out-of-the-box */
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_RTS_CTS; /* Changed to NONE to fix the floating CTS bug out-of-the-box */
   huart1.Init.OverSampling = UART_OVERSAMPLING_16;
   if (HAL_UART_Init(&huart1) != HAL_OK)
   {
@@ -161,29 +161,5 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef *uartHandle)
 }
 
 /* USER CODE BEGIN 1 */
-/**
- * @brief  Enable Hardware Flow Control (RTS/CTS) dynamically.
- * @param  huart: UART handle
- */
-void HW_CONTROL_ON(UART_HandleTypeDef *huart)
-{
-  /* Update the HAL handle state for consistency */
-  huart->Init.HwFlowCtl = UART_HWCONTROL_RTS_CTS;
 
-  /* Modify the hardware register directly to enable RTS and CTS */
-  SET_BIT(huart->Instance->CR3, USART_CR3_RTSE | USART_CR3_CTSE);
-}
-
-/**
- * @brief  Disable Hardware Flow Control (RTS/CTS) dynamically.
- * @param  huart: UART handle
- */
-void HW_CONTROL_OFF(UART_HandleTypeDef *huart)
-{
-  /* Update the HAL handle state for consistency */
-  huart->Init.HwFlowCtl = UART_HWCONTROL_NONE;
-
-  /* Modify the hardware register directly to disable RTS and CTS */
-  CLEAR_BIT(huart->Instance->CR3, USART_CR3_RTSE | USART_CR3_CTSE);
-}
 /* USER CODE END 1 */

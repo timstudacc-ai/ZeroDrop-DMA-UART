@@ -44,7 +44,6 @@
 #include "uart_ring_buffer.h"
 #include "packet_protocol.h"
 #include "uart_dma_manager.h"
-#define TX_BUFFER_WATERMARK 32
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -131,16 +130,12 @@ int main(void)
      * Only process incoming packets if we have enough space in the TX buffer 
      * to safely store the maximum possible response. 
      */
-    uint16_t tx_count = rb_get_count(&tx_buffer);
-    uint16_t tx_free = (RING_BUFFER_SIZE - 1) - tx_count;
-    
-    if (tx_free >= TX_BUFFER_WATERMARK)
+   // uint16_t tx_count = rb_get_count(&tx_buffer);
+    // uint16_t tx_free = (RING_BUFFER_SIZE - 1) - tx_count ;
+   
+    uint16_t len = pkt_pop_binary_packet_crc(&rx_buffer, 0xAA, my_payload, sizeof(my_payload) - 1);
+    if (len > 0)
     {
-      /* Check if there is a valid packet with correct CRC in the ring buffer */
-      /* We read it as a binary array first to determine its type */
-      uint16_t len = pkt_pop_binary_packet_crc(&rx_buffer, 0xAA, my_payload, sizeof(my_payload) - 1);
-      if (len > 0)
-      {
         my_payload[len] = '\0'; /* Null terminate in case it is a string */
 
         /* Process known string commands or default to binary echo */
@@ -177,8 +172,9 @@ int main(void)
       }
     }
   }
+  
   /* USER CODE END 3 */
-}
+
 
 /**
  * @brief System Clock Configuration

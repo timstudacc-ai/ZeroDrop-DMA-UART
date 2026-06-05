@@ -98,6 +98,7 @@ class UARTTestbench:
             stopbits=serial.STOPBITS_ONE,
             timeout=self._timeout,
             write_timeout=self._timeout,
+            rtscts=True,
         )
         self._serial.reset_input_buffer()
         self._serial.reset_output_buffer()

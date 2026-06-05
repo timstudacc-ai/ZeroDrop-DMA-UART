@@ -15,7 +15,7 @@ HAL_StatusTypeDef UART_Manager_Init(UART_HandleTypeDef *huart, RingBuffer *rx_pt
 
 /**
  * @brief Periodic task for UART Manager.
- *        Handles RTS flow control and kicking off TX DMA transfers.
+ *        Handles kicking off TX DMA transfers using Ping-Pong buffering.
  *        Must be called continuously in the main loop or RTOS task.
  */
 void UART_Manager_Task(void);

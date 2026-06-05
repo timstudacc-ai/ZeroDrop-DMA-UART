@@ -136,40 +136,11 @@ int main(void)
     uint16_t len = pkt_pop_binary_packet_crc(&rx_buffer, 0xAA, my_payload, sizeof(my_payload) - 1);
     if (len > 0)
     {
-        my_payload[len] = '\0'; /* Null terminate in case it is a string */
-
-        /* Process known string commands or default to binary echo */
-        if (strcmp((char *)my_payload, "LED_ON") == 0)
-        {
-          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET); /* Turn ON LED (active low) */
-          pkt_push_string_crc(&tx_buffer, 0xAA, "LED is now ON");
-        }
-        else if (strcmp((char *)my_payload, "LED_OFF") == 0)
-        {
-          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET); /* Turn OFF LED */
-          pkt_push_string_crc(&tx_buffer, 0xAA, "LED is now OFF");
-        }
-        else if (strcmp((char *)my_payload, "TEST_CAPACITY") == 0)
-        {
-          /* Generate a 110 character string to test tx_buffer capacity */
-          char cap_test[120];
-          memset(cap_test, 'C', 110);
-          cap_test[110] = '\0';
-          pkt_push_string_crc(&tx_buffer, 0xAA, cap_test);
-        }
-        else if (strncmp((char *)my_payload, "Msg#", 4) == 0)
-        {
-          /* Echo the string back with a prefix */
-          pkt_push_string_crc(&tx_buffer, 0xAA, "Echo: ");
-          pkt_push_string_crc(&tx_buffer, 0xAA, (char *)my_payload);
-        }
-        else
-        {
-          /* --- RAW BINARY ARRAY HANDLING --- */
-          /* Echo the raw binary array exactly as received */
-          pkt_push_binary_packet_crc(&tx_buffer, 0xAA, my_payload, len);
-        }
-      }
+        /* --- APPLICATION LOGIC GOES HERE --- */
+        /* A valid, CRC-verified packet has been successfully received. */
+        
+        /* Example: Echo the raw binary payload back to the sender */
+        // pkt_push_binary_packet_crc(&tx_buffer, 0xAA, my_payload, len);
     }
   }
   

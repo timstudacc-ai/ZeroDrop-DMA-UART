@@ -198,24 +198,28 @@ int main(void) {
 
 ---
 
-## 6. Build & Flash Instructions
+## 6. Build, Flash & Test Instructions
 
 This project is built using the **PlatformIO** ecosystem. 
 
-**Dependencies:** STM32Cube HAL (managed automatically by PlatformIO).
+**Dependencies:** 
+- STM32Cube HAL (managed automatically by PlatformIO).
+- Python 3.8+ and `pyserial` (for running the HIL tests).
 
-Run the following commands in your terminal to clone, build, and upload the firmware directly to your board:
+Run the following commands in your terminal to clone, build, and test the firmware:
 
 ```bash
-# Clone the repository
+# 1. Clone the repository
 git clone https://github.com/yourusername/stm32-high-perf-uart-dma-protocol.git
 cd stm32-high-perf-uart-dma-protocol
 
-# Compile and upload the firmware (ensure your ST-Link is connected)
+# 2. Compile and upload the firmware (ensure your ST-Link is connected)
 pio run --target upload
 
-# Open the serial monitor
-pio device monitor
+# 3. Install Python testing dependencies
+pip install pyserial
+
+
 ```
 
 ---

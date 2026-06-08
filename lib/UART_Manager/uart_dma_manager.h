@@ -20,4 +20,10 @@ HAL_StatusTypeDef UART_Manager_Init(UART_HandleTypeDef *huart, RingBuffer *rx_pt
  */
 void UART_Manager_Task(void);
 
+/**
+ * @brief Enable or disable software manual flow control.
+ * @param enable true to enable flow control, false to disable.
+ */
+void UART_Manager_EnableSoftwareFlowControl(bool enable);
+
 #endif /* UART_DMA_MANAGER_H */

@@ -68,7 +68,7 @@ flowchart TD
 ### 1. Hardware Layer (Low-Level Driver)
 At the lowest level, the CPU is completely decoupled from the physical data transfer.
 - **Silent DMA Reception:** The DMA Controller operates in the background, silently pulling raw incoming bytes directly from the UART hardware register and streaming them into a temporary circular memory array (`rx_dma_buf`). This happens entirely without waking up the CPU, conserving massive amounts of processing power.
-**RTS/CTS Flow Control:** To prevent faults and silent data loss when the software buffers near overflow, the system utilizes hardware flow control. If the MCU cannot process data fast enough, it de-asserts the RTS pin, commanding the remote device to pause. Conversely, if the remote device's buffer is full, it de-asserts our CTS pin, safely pausing our TX DMA transfers until space clears up.
+- **Manual Software RTS/CTS Flow Control:** To prevent faults and silent data loss when the software buffers near overflow, the system utilizes an active, software-driven flow control architecture. By default, built-in hardware flow control can conflict with high-speed DMA. Instead, this driver continuously monitors the capacities of the `rx_buffer` and `tx_buffer`. If the MCU cannot process data fast enough (buffer > 80% full), it manually drives the **PA12 (RTS)** GPIO pin HIGH, commanding the remote device to pause. This logic is handled neatly in `UART_Manager_Task()` and can be enabled dynamically via `UART_Manager_EnableSoftwareFlowControl(true)`.
 
 ### 2. ISR & Synchronization Layer
 - **IDLE Line Interrupt Trigger:** Because data arrives in variable-length packets, standard byte-counting DMA is insufficient. Instead, the hardware detects when the physical UART line goes quiet (IDLE). This IDLE Line Interrupt instantly wakes the CPU, signaling that a complete packet burst has arrived. The ISR then quickly extracts this block of data and pushes it into a thread-safe software Ring Buffer to trigger parsing.
@@ -100,8 +100,8 @@ To replicate this architecture, ensure proper hardware linkage for the DMA contr
 | **USARTX / DMA (TX)** | DMA Request | `USARTX_TX` (Mode: **Normal**) |
 | **DMA Settings** | Increment Address | Peripheral: **Disabled**, Memory: **Enabled** (MINC) |
 | **DMA Settings** | Data Width | Peripheral: `Byte`, Memory: `Byte` |
-| **Hardware Wiring** | CTS Pin | Connect to remote **RTS** |
-| **Hardware Wiring** | RTS Pin | Connect to remote **CTS** |
+| **Hardware Wiring** | Any GPIO Output (e.g., PA11 as CTS) | Connect to remote **RTS** (Optional visual indicator) |
+| **Hardware Wiring** | Any GPIO Output (e.g., PA12 as RTS) | Connect to remote **CTS** |
 
 > [!IMPORTANT]
 > **Initialization Order Matters:** Ensure that the DMA controller (and its clock) is initialized **before** the UART initialization. The UART hardware links to the DMA channels during its initialization phase.
@@ -129,7 +129,7 @@ To simulate harsh industrial environments and edge cases, the testbench applies 
 
 ### Benchmark Results
 
-#### Final Results for 115200 Baud (Hardware Flow Control Enabled, 512B Ring Buffer)
+#### Final Results for 115200 Baud (Active Software Flow Control Enabled, 512B Ring Buffer)
 | Test Case | Mode | Modifiers | Packets | Payload | Success | Error | Timeouts |
 |---|---|---|---|---|---|---|---|
 | Baseline Binary | binary | None | 100 | 8 | 100.0% | 0.0% | 0 |
@@ -181,9 +181,12 @@ int main(void) {
     rb_init(&rx_buffer);
     rb_init(&tx_buffer);
     UART_Manager_Init(&huart1, &rx_buffer, &tx_buffer);
+    
+    // Enable active software flow control (Hysteresis-based RTS/CTS)
+    UART_Manager_EnableSoftwareFlowControl(true);
 
     while (1) {
-        // 2. Non-blocking Task: Kicks off pending TX DMA transfers
+        // 2. Non-blocking Task: Kicks off pending TX DMA transfers & handles Flow Control
         UART_Manager_Task(); 
         
         // 3. Attempt to pop a valid, CRC-verified packet from RX ring buffer

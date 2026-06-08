@@ -1,8 +1,7 @@
 #include "uart_dma_manager.h"
 #include "dma.h"
+#include "main.h" /* For GPIO definitions */
 #include <stdbool.h>
-
-
 
 /* Encapsulated static state for the UART DMA Manager */
 static UART_HandleTypeDef *p_huart = NULL; /* Pointer to the UART hardware handle */
@@ -10,9 +9,10 @@ static RingBuffer *p_rx_buf = NULL;        /* High-level software ring buffer fo
 static RingBuffer *p_tx_buf = NULL;        /* High-level software ring buffer for transmission */
 
 /* Hardware DMA Buffers */
-static uint8_t rx_dma_buf[256]; /* Circular DMA buffer for continuous background reception */
-static uint8_t tx_buf_A[256];   /* Ping-Pong TX Buffer A */
-static uint8_t tx_buf_B[256];   /* Ping-Pong TX Buffer B */
+#define BUFFER_SIZE 128
+static uint8_t rx_dma_buf[BUFFER_SIZE]; /* Circular DMA buffer for continuous background reception */
+static uint8_t tx_buf_A[BUFFER_SIZE];   /* Ping-Pong TX Buffer A */
+static uint8_t tx_buf_B[BUFFER_SIZE];   /* Ping-Pong TX Buffer B */
 
 /* State variables for RX Circular Extraction */
 static uint16_t rx_old_pos = 0; /* Tracks the last read position in rx_dma_buf */
@@ -20,6 +20,24 @@ static uint16_t rx_old_pos = 0; /* Tracks the last read position in rx_dma_buf *
 /* State variables for TX Ping-Pong Operation */
 static volatile bool tx_dma_busy = false;  /* Flag indicating if the TX DMA is currently transmitting */
 static volatile uint8_t tx_active_buf = 0; /* Indicates which ping-pong buffer is currently held by DMA (0 = A, 1 = B) */
+
+/* Software Flow Control State */
+static bool sw_flow_control_enabled = false;
+
+/* Flow Control Watermarks (Hysteresis) */
+#define RX_BUFFER_WATERMARK_HIGH (RING_BUFFER_SIZE * 0.8)
+#define RX_BUFFER_WATERMARK_LOW  (RING_BUFFER_SIZE * 0.2)
+#define TX_BUFFER_WATERMARK_HIGH (RING_BUFFER_SIZE * 0.8)
+#define TX_BUFFER_WATERMARK_LOW  (RING_BUFFER_SIZE * 0.2)
+
+/**
+ * @brief Enable or disable software manual flow control.
+ * @param enable true to enable flow control, false to disable.
+ */
+void UART_Manager_EnableSoftwareFlowControl(bool enable)
+{
+    sw_flow_control_enabled = enable;
+}
 
 /**
  * @brief  Initializes the UART DMA Manager.
@@ -54,6 +72,30 @@ void UART_Manager_Task(void)
     if (p_huart == NULL || p_rx_buf == NULL || p_tx_buf == NULL)
     {
         return;
+    }
+
+    /* 1. Software Flow Control */
+    if (sw_flow_control_enabled)
+    {
+        uint16_t rx_count = rb_get_count(p_rx_buf);
+        if (rx_count >= RX_BUFFER_WATERMARK_HIGH)
+        {
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_SET);   /* Assert RTS HIGH (Stop) */
+        }
+        else if (rx_count <= RX_BUFFER_WATERMARK_LOW)
+        {
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET); /* Assert RTS LOW (Ready) */
+        }
+
+        uint16_t tx_count = rb_get_count(p_tx_buf);
+        if (tx_count >= TX_BUFFER_WATERMARK_HIGH) 
+        {
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_SET); 
+        }
+        else if (tx_count <= TX_BUFFER_WATERMARK_LOW) 
+        {
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_RESET);
+        }
     }
 
     /* 2. DMA TX Kick-off */

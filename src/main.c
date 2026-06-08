@@ -57,7 +57,7 @@
 /* Ring buffer instances (RX and TX) */
 RingBuffer rx_buffer;
 RingBuffer tx_buffer;
-uint8_t my_payload[128]; /* Buffer for storing unpacked payload after CRC validation */
+uint8_t my_payload[256]; /* Buffer for storing unpacked payload after CRC validation */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -114,6 +114,9 @@ int main(void)
     Error_Handler();
   }
 
+  /* Enable Software Flow Control managed by UART_Manager_Task */
+  UART_Manager_EnableSoftwareFlowControl(true);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -125,13 +128,6 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     UART_Manager_Task();
-    
-    /* 2. Software TX Flow Control (Option 2)
-     * Only process incoming packets if we have enough space in the TX buffer 
-     * to safely store the maximum possible response. 
-     */
-   // uint16_t tx_count = rb_get_count(&tx_buffer);
-    // uint16_t tx_free = (RING_BUFFER_SIZE - 1) - tx_count ;
    
     uint16_t len = pkt_pop_binary_packet_crc(&rx_buffer, 0xAA, my_payload, sizeof(my_payload) - 1);
     if (len > 0)
@@ -140,7 +136,7 @@ int main(void)
         /* A valid, CRC-verified packet has been successfully received. */
         
         /* Example: Echo the raw binary payload back to the sender */
-        // pkt_push_binary_packet_crc(&tx_buffer, 0xAA, my_payload, len);
+        /* pkt_push_binary_packet_crc(&tx_buffer, 0xAA, my_payload, len); */
     }
   }
   

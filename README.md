@@ -10,7 +10,7 @@
 ---
 
 ## 1. Production Architecture Overview
-
+ 
 The firmware is designed with a strict separation of concerns, divided into four distinct layers. This modular approach ensures that the application logic is completely decoupled from hardware constraints, eliminating bottlenecks associated with standard blocking calls or byte-by-byte interrupt designs.
 
 ```mermaid
